@@ -29,6 +29,22 @@ inline float3 sampleTextureBilinear(device uchar4* texData, uint offset,
     return mix(mix(c00, c10, fx), mix(c01, c11, fx), fy);
 }
 
+inline float3 perturbLiquidNormal(float3 normal, float3 hitPoint, float2 uv, float roughness) {
+    float3 tangent;
+    float3 bitangent;
+    buildTangentFrame(normal, tangent, bitangent);
+
+    float wave0 = sin(dot(hitPoint.xz, float2(0.065f, 0.041f)) + uv.x * 18.0f + uv.y * 11.0f);
+    float wave1 = cos(dot(hitPoint.xz, float2(-0.038f, 0.057f)) - uv.x * 9.0f + uv.y * 14.0f);
+    float wave2 = sin(dot(hitPoint.xz, float2(0.022f, -0.071f)) + uv.x * 5.0f - uv.y * 7.0f);
+
+    float waveStrength = mix(0.035f, 0.12f, saturate(roughness * 6.0f));
+    float3 perturbed = normal +
+                       tangent * (wave0 * waveStrength + wave2 * (waveStrength * 0.5f)) +
+                       bitangent * (wave1 * waveStrength);
+    return normalize(perturbed);
+}
+
 // ─── Path Tracing Compute Kernel ─────────────────────────────────────────────
 
 kernel void pathTraceKernel(
@@ -171,12 +187,12 @@ kernel void pathTraceKernel(
             // Get material
             Material mat = materials[v0.materialIndex];
             float3 albedo = float3(mat.albedo);
+            float2 hitUV = float2(v0.uv) * bw +
+                           float2(v1.uv) * barycentrics.x +
+                           float2(v2.uv) * barycentrics.y;
 
             // Sample texture if available
             if (mat.textureWidth > 0 && mat.textureOffset != 0xFFFFFFFF) {
-                float2 hitUV = float2(v0.uv) * bw +
-                               float2(v1.uv) * barycentrics.x +
-                               float2(v2.uv) * barycentrics.y;
                 albedo = sampleTextureBilinear(textureData, mat.textureOffset,
                                               mat.textureWidth, mat.textureHeight, hitUV);
             }
@@ -264,12 +280,24 @@ kernel void pathTraceKernel(
             }
 
             if (isTransmissive) {
+                float3 liquidNormal = perturbLiquidNormal(hitNormal, hitPoint, hitUV, roughness);
+                if (dot(liquidNormal, viewDir) <= 0.0f) {
+                    liquidNormal = hitNormal;
+                }
+
+                float liquidRoughness = clamp(roughness, 0.04f, 0.18f);
+                float3 microNormal = sampleGGXHalfVector(liquidNormal, liquidRoughness, rng.next2());
+                if (dot(microNormal, viewDir) <= 0.0f) {
+                    microNormal = liquidNormal;
+                }
+
                 float etaI = frontFace ? 1.0f : ior;
                 float etaT = frontFace ? ior : 1.0f;
                 float etaRatio = etaI / etaT;
-                float reflectance = dielectricReflectance(ndotv, etaI, etaT);
-                float3 reflectedDir = reflect(r.direction, hitNormal);
-                float3 refractedDir = refract(r.direction, hitNormal, etaRatio);
+                float liquidNdotV = saturate(dot(microNormal, viewDir));
+                float reflectance = dielectricReflectance(liquidNdotV, etaI, etaT);
+                float3 reflectedDir = reflect(r.direction, microNormal);
+                float3 refractedDir = refract(r.direction, microNormal, etaRatio);
                 bool hasRefraction = dot(refractedDir, refractedDir) > 1e-6f;
 
                 bool sampleReflection = !hasRefraction || rng.next() < reflectance;
