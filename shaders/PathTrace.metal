@@ -143,7 +143,8 @@ kernel void pathTraceKernel(
             );
 
             float3 hitPoint = r.origin + r.direction * hitDistance;
-            if (dot(hitNormal, r.direction) > 0.0f) {
+            bool frontFace = dot(hitNormal, r.direction) < 0.0f;
+            if (!frontFace) {
                 hitNormal = -hitNormal;
             }
 
@@ -186,6 +187,7 @@ kernel void pathTraceKernel(
             float ior = max(mat.ior, 1.0f);
             float3 viewDir = -r.direction;
             float3 emission = float3(mat.emissiveColor) * mat.emissiveStrength;
+            bool isTransmissive = transmissive > 0.0f;
 
             // Handle emissive surfaces
             if (mat.emissiveStrength > 0.0f) {
@@ -201,7 +203,7 @@ kernel void pathTraceKernel(
             }
 
             // ── Next Event Estimation (direct light sampling) ──
-            if (uniforms.lightCount > 0 && transmissive < 0.99f) {
+            if (uniforms.lightCount > 0 && !isTransmissive) {
                 uint lightIdx = min(uint(rng.next() * float(uniforms.lightCount)),
                                     uniforms.lightCount - 1);
                 Light light = lights[lightIdx];
@@ -244,6 +246,38 @@ kernel void pathTraceKernel(
                         radiance += throughput * emission * brdf * G / pdf;
                     }
                 }
+            }
+
+            if (isTransmissive) {
+                float etaI = frontFace ? 1.0f : ior;
+                float etaT = frontFace ? ior : 1.0f;
+                float etaRatio = etaI / etaT;
+                float reflectance = dielectricReflectance(ndotv, etaI, etaT);
+                float3 reflectedDir = reflect(r.direction, hitNormal);
+                float3 refractedDir = refract(r.direction, hitNormal, etaRatio);
+                bool hasRefraction = dot(refractedDir, refractedDir) > 1e-6f;
+
+                bool sampleReflection = !hasRefraction || rng.next() < reflectance;
+                float3 newDir = sampleReflection ? normalize(reflectedDir) : normalize(refractedDir);
+
+                if (!sampleReflection) {
+                    float transmissionChance = max(1.0f - reflectance, 1e-3f);
+                    float3 transmissionTint = transmissionTintFromAlbedo(albedo);
+                    throughput *= (transmissionTint * transmissive) / transmissionChance;
+                }
+
+                previousBounceWasSpecular = true;
+
+                if (bounce >= 3) {
+                    float p = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05f, 0.95f);
+                    if (rng.next() > p) break;
+                    throughput /= p;
+                }
+
+                float3 normalOffset = dot(newDir, hitNormal) >= 0.0f ? hitNormal : -hitNormal;
+                r.origin = hitPoint + normalOffset * 0.001f;
+                r.direction = newDir;
+                continue;
             }
 
             float3 Fview = fresnelSchlick(ndotv, materialF0(albedo, metallic, ior));

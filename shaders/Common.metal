@@ -146,6 +146,27 @@ inline float3 fresnelSchlick(float cosTheta, float3 F0) {
     return F0 + (1.0f - F0) * pow(clamp(1.0f - cosTheta, 0.0f, 1.0f), 5.0f);
 }
 
+inline float dielectricReflectance(float cosThetaI, float etaI, float etaT) {
+    cosThetaI = clamp(cosThetaI, 0.0f, 1.0f);
+
+    float sinThetaI = sqrt(max(0.0f, 1.0f - cosThetaI * cosThetaI));
+    float sinThetaT = (etaI / etaT) * sinThetaI;
+    if (sinThetaT >= 1.0f) {
+        return 1.0f;
+    }
+
+    float cosThetaT = sqrt(max(0.0f, 1.0f - sinThetaT * sinThetaT));
+    float rParallel = ((etaT * cosThetaI) - (etaI * cosThetaT)) /
+                      max((etaT * cosThetaI) + (etaI * cosThetaT), 1e-5f);
+    float rPerpendicular = ((etaI * cosThetaI) - (etaT * cosThetaT)) /
+                           max((etaI * cosThetaI) + (etaT * cosThetaT), 1e-5f);
+    return 0.5f * (rParallel * rParallel + rPerpendicular * rPerpendicular);
+}
+
+inline float3 transmissionTintFromAlbedo(float3 albedo) {
+    return clamp(mix(float3(1.0f), saturate(albedo), 0.65f), float3(0.18f), float3(1.0f));
+}
+
 inline float ggxDistribution(float ndoth, float roughness) {
     float alpha = max(0.045f, roughness * roughness);
     float a2 = alpha * alpha;

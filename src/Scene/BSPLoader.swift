@@ -515,9 +515,9 @@ class BSPLoader {
         if n.hasPrefix("*water") {
             return MaterialClassification(
                 surfaceType: MaterialSurfaceType.liquid.rawValue,
-                roughness: 0.04,
+                roughness: 0.02,
                 metallic: 0.0,
-                transmissive: 0.92,
+                transmissive: 0.97,
                 ior: 1.333
             )
         }
@@ -525,9 +525,9 @@ class BSPLoader {
         if n.hasPrefix("*slime") {
             return MaterialClassification(
                 surfaceType: MaterialSurfaceType.liquid.rawValue,
-                roughness: 0.08,
+                roughness: 0.05,
                 metallic: 0.0,
-                transmissive: 0.75,
+                transmissive: 0.82,
                 ior: 1.38
             )
         }
