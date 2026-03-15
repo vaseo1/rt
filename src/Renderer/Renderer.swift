@@ -400,13 +400,25 @@ class Renderer {
 
         // Materials
         materials.append(ParsedMaterial(name: "white", albedo: SIMD3<Float>(0.73, 0.73, 0.73), emissiveStrength: 0,
-                                        emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+                                        emissiveColor: .zero, surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                                        roughness: 0.82, metallic: 0.0, transmissive: 0.0, ior: 1.5,
+                                        textureWidth: 0, textureHeight: 0, texturePixels: nil))
         materials.append(ParsedMaterial(name: "red", albedo: SIMD3<Float>(0.65, 0.05, 0.05), emissiveStrength: 0,
-                                        emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+                                        emissiveColor: .zero, surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                                        roughness: 0.76, metallic: 0.0, transmissive: 0.0, ior: 1.5,
+                                        textureWidth: 0, textureHeight: 0, texturePixels: nil))
         materials.append(ParsedMaterial(name: "green", albedo: SIMD3<Float>(0.12, 0.45, 0.15), emissiveStrength: 0,
-                                        emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+                                        emissiveColor: .zero, surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                                        roughness: 0.76, metallic: 0.0, transmissive: 0.0, ior: 1.5,
+                                        textureWidth: 0, textureHeight: 0, texturePixels: nil))
+        materials.append(ParsedMaterial(name: "metal", albedo: SIMD3<Float>(0.72, 0.73, 0.76), emissiveStrength: 0,
+                                        emissiveColor: .zero, surfaceType: MaterialSurfaceType.metal.rawValue,
+                                        roughness: 0.14, metallic: 0.96, transmissive: 0.0, ior: 1.5,
+                                        textureWidth: 0, textureHeight: 0, texturePixels: nil))
         materials.append(ParsedMaterial(name: "light", albedo: SIMD3<Float>(1.0, 0.9, 0.7), emissiveStrength: 15.0,
-                                        emissiveColor: SIMD3<Float>(1.0, 0.9, 0.7), textureWidth: 0, textureHeight: 0, texturePixels: nil))
+                                        emissiveColor: SIMD3<Float>(1.0, 0.9, 0.7), surfaceType: MaterialSurfaceType.emissive.rawValue,
+                                        roughness: 0.25, metallic: 0.0, transmissive: 0.0, ior: 1.0,
+                                        textureWidth: 0, textureHeight: 0, texturePixels: nil))
 
         let s: Float = 200 // half-size of room
 
@@ -449,7 +461,7 @@ class Renderer {
         let ls: Float = 60
         addQuad(v0: SIMD3(-ls, s*2 - 1, -ls), v1: SIMD3(ls, s*2 - 1, -ls),
                 v2: SIMD3(ls, s*2 - 1, ls), v3: SIMD3(-ls, s*2 - 1, ls),
-                normal: SIMD3(0, -1, 0), material: 3)
+            normal: SIMD3(0, -1, 0), material: 4)
 
         // Box 1 (tall)
         let bx: Float = -60, bz: Float = -40, bw: Float = 60, bh: Float = 180
@@ -473,19 +485,19 @@ class Renderer {
         let b2x: Float = 50, b2z: Float = 60, b2w: Float = 60, b2h: Float = 90
         addQuad(v0: SIMD3(b2x, 0, b2z), v1: SIMD3(b2x, b2h, b2z),
                 v2: SIMD3(b2x+b2w, b2h, b2z), v3: SIMD3(b2x+b2w, 0, b2z),
-                normal: SIMD3(0, 0, 1), material: 0)
+            normal: SIMD3(0, 0, 1), material: 3)
         addQuad(v0: SIMD3(b2x+b2w, 0, b2z-b2w), v1: SIMD3(b2x+b2w, b2h, b2z-b2w),
                 v2: SIMD3(b2x, b2h, b2z-b2w), v3: SIMD3(b2x, 0, b2z-b2w),
-                normal: SIMD3(0, 0, -1), material: 0)
+            normal: SIMD3(0, 0, -1), material: 3)
         addQuad(v0: SIMD3(b2x, 0, b2z-b2w), v1: SIMD3(b2x, b2h, b2z-b2w),
                 v2: SIMD3(b2x, b2h, b2z), v3: SIMD3(b2x, 0, b2z),
-                normal: SIMD3(-1, 0, 0), material: 0)
+            normal: SIMD3(-1, 0, 0), material: 3)
         addQuad(v0: SIMD3(b2x+b2w, 0, b2z), v1: SIMD3(b2x+b2w, b2h, b2z),
                 v2: SIMD3(b2x+b2w, b2h, b2z-b2w), v3: SIMD3(b2x+b2w, 0, b2z-b2w),
-                normal: SIMD3(1, 0, 0), material: 0)
+            normal: SIMD3(1, 0, 0), material: 3)
         addQuad(v0: SIMD3(b2x, b2h, b2z), v1: SIMD3(b2x, b2h, b2z-b2w),
                 v2: SIMD3(b2x+b2w, b2h, b2z-b2w), v3: SIMD3(b2x+b2w, b2h, b2z),
-                normal: SIMD3(0, 1, 0), material: 0)
+            normal: SIMD3(0, 1, 0), material: 3)
 
         return BSPData(
             vertices: vertices,

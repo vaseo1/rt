@@ -92,14 +92,34 @@ struct ParsedVertex {
     var materialIndex: UInt32
 }
 
+enum MaterialSurfaceType: UInt32 {
+    case diffuse = 0
+    case metal = 1
+    case liquid = 2
+    case emissive = 3
+}
+
 struct ParsedMaterial {
     var name: String
     var albedo: SIMD3<Float>
     var emissiveStrength: Float
     var emissiveColor: SIMD3<Float>
+    var surfaceType: UInt32
+    var roughness: Float
+    var metallic: Float
+    var transmissive: Float
+    var ior: Float
     var textureWidth: Int
     var textureHeight: Int
     var texturePixels: [UInt8]?
+}
+
+private struct MaterialClassification {
+    let surfaceType: UInt32
+    let roughness: Float
+    let metallic: Float
+    let transmissive: Float
+    let ior: Float
 }
 
 struct BSPData {
@@ -167,6 +187,7 @@ class BSPLoader {
                              name.hasPrefix("*teleport") ||
                              name.hasPrefix("flame") ||
                              name.contains("light")
+            let classification = classifyMaterial(named: name, isEmissive: isEmissive)
 
             // Convert paletted texture to RGBA using Quake palette
             var texturePixels: [UInt8]? = nil
@@ -188,6 +209,11 @@ class BSPLoader {
                 albedo: colorForTexture(name: name),
                 emissiveStrength: isEmissive ? 25.0 : 0.0,
                 emissiveColor: isEmissive ? emissiveColorForTexture(name: name) : .zero,
+                surfaceType: classification.surfaceType,
+                roughness: classification.roughness,
+                metallic: classification.metallic,
+                transmissive: classification.transmissive,
+                ior: classification.ior,
                 textureWidth: Int(tex.width),
                 textureHeight: Int(tex.height),
                 texturePixels: texturePixels
@@ -196,7 +222,9 @@ class BSPLoader {
 
         if materials.isEmpty {
             materials.append(ParsedMaterial(name: "default", albedo: SIMD3<Float>(0.7, 0.7, 0.7), emissiveStrength: 0,
-                                            emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+                                            emissiveColor: .zero, surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                                            roughness: 0.85, metallic: 0.0, transmissive: 0.0, ior: 1.5,
+                                            textureWidth: 0, textureHeight: 0, texturePixels: nil))
         }
 
         // Triangulate faces
@@ -437,7 +465,7 @@ class BSPLoader {
 
     private func readValue<T>(at offset: Int) -> T {
         data.withUnsafeBytes { ptr in
-            var value = UnsafeMutablePointer<T>.allocate(capacity: 1)
+            let value = UnsafeMutablePointer<T>.allocate(capacity: 1)
             defer { value.deallocate() }
             memcpy(value, ptr.baseAddress! + offset, MemoryLayout<T>.size)
             return value.pointee
@@ -469,6 +497,114 @@ class BSPLoader {
         if n.hasPrefix("flame")     { return SIMD3<Float>(1.0, 0.6, 0.1) }
         // Default warm white for light textures
         return SIMD3<Float>(1.0, 0.9, 0.7)
+    }
+
+    private func classifyMaterial(named name: String, isEmissive: Bool) -> MaterialClassification {
+        let n = name.lowercased()
+
+        if isEmissive {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.emissive.rawValue,
+                roughness: n.hasPrefix("*lava") ? 0.45 : 0.3,
+                metallic: 0.0,
+                transmissive: 0.0,
+                ior: 1.0
+            )
+        }
+
+        if n.hasPrefix("*water") {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.liquid.rawValue,
+                roughness: 0.04,
+                metallic: 0.0,
+                transmissive: 0.92,
+                ior: 1.333
+            )
+        }
+
+        if n.hasPrefix("*slime") {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.liquid.rawValue,
+                roughness: 0.08,
+                metallic: 0.0,
+                transmissive: 0.75,
+                ior: 1.38
+            )
+        }
+
+        if n.contains("metal") || n.contains("chrome") || n.contains("steel") ||
+            n.contains("iron") || n.contains("grate") || n.contains("chain") ||
+            n.contains("gear") || n.contains("plate") || n.contains("bolt") ||
+            n.contains("silver") || n.contains("copper") || n.contains("brass") ||
+            (n.contains("door") && !n.contains("wood")) {
+            let roughness: Float
+            if n.contains("chrome") {
+                roughness = 0.08
+            } else if n.contains("grate") || n.contains("chain") {
+                roughness = 0.32
+            } else if n.contains("door") {
+                roughness = 0.28
+            } else {
+                roughness = 0.18
+            }
+
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.metal.rawValue,
+                roughness: roughness,
+                metallic: 0.92,
+                transmissive: 0.0,
+                ior: 1.5
+            )
+        }
+
+        if n.contains("wood") || n.contains("crate") || n.contains("beam") {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                roughness: 0.72,
+                metallic: 0.0,
+                transmissive: 0.0,
+                ior: 1.5
+            )
+        }
+
+        if n.contains("brick") || n.contains("stone") || n.contains("rock") ||
+            n.contains("wall") || n.contains("mortar") {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                roughness: 0.88,
+                metallic: 0.0,
+                transmissive: 0.0,
+                ior: 1.5
+            )
+        }
+
+        if n.contains("floor") || n.contains("tile") || n.contains("trim") {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                roughness: 0.62,
+                metallic: 0.0,
+                transmissive: 0.0,
+                ior: 1.5
+            )
+        }
+
+        if n.hasPrefix("sky") {
+            return MaterialClassification(
+                surfaceType: MaterialSurfaceType.diffuse.rawValue,
+                roughness: 1.0,
+                metallic: 0.0,
+                transmissive: 0.0,
+                ior: 1.0
+            )
+        }
+
+        return MaterialClassification(
+            surfaceType: MaterialSurfaceType.diffuse.rawValue,
+            roughness: 0.82,
+            metallic: 0.0,
+            transmissive: 0.0,
+            ior: 1.5
+        )
     }
 
     private func smoothNormals(vertices: inout [ParsedVertex], indices: [UInt32]) {
@@ -586,7 +722,7 @@ class BSPLoader {
 
 private func readUnaligned<T>(from data: Data, at offset: Int) -> T {
     data.withUnsafeBytes { ptr in
-        var value = UnsafeMutablePointer<T>.allocate(capacity: 1)
+        let value = UnsafeMutablePointer<T>.allocate(capacity: 1)
         defer { value.deallocate() }
         memcpy(value, ptr.baseAddress! + offset, MemoryLayout<T>.size)
         return value.pointee

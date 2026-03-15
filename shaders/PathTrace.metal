@@ -92,11 +92,12 @@ kernel void pathTraceKernel(
 
         // ── Path trace with multiple bounces ──
 
-        float3 radiance   = float3(0.0f);
-    float3 throughput = float3(1.0f);
-    float  primaryDepth = 1.0f;
-    float2 primaryMotion = float2(0.0f);
-    bool   hasPrimaryHit = false;
+        float3 radiance = float3(0.0f);
+        float3 throughput = float3(1.0f);
+        float  primaryDepth = 1.0f;
+        float2 primaryMotion = float2(0.0f);
+        bool   hasPrimaryHit = false;
+        bool   previousBounceWasSpecular = false;
 
         ray r;
         r.origin       = rayOrigin;
@@ -106,9 +107,6 @@ kernel void pathTraceKernel(
 
         intersector<triangle_data> inter;
         inter.accept_any_intersection(false);
-
-
-
         for (uint bounce = 0; bounce < uniforms.maxBounces; bounce++) {
             auto intersection = inter.intersect(r, accelStructure);
 
@@ -145,6 +143,9 @@ kernel void pathTraceKernel(
             );
 
             float3 hitPoint = r.origin + r.direction * hitDistance;
+            if (dot(hitNormal, r.direction) > 0.0f) {
+                hitNormal = -hitNormal;
+            }
 
             if (bounce == 0) {
                 float4 currentClip = uniforms.currentViewProjection * float4(hitPoint, 1.0f);
@@ -179,18 +180,28 @@ kernel void pathTraceKernel(
                                               mat.textureWidth, mat.textureHeight, hitUV);
             }
 
+            float roughness = clamp(mat.roughness, 0.045f, 1.0f);
+            float metallic = saturate(mat.metallic);
+            float transmissive = saturate(mat.transmissive);
+            float ior = max(mat.ior, 1.0f);
+            float3 viewDir = -r.direction;
+            float3 emission = float3(mat.emissiveColor) * mat.emissiveStrength;
+
             // Handle emissive surfaces
             if (mat.emissiveStrength > 0.0f) {
-                // With NEE: only count direct visibility (bounce 0)
-                // Without NEE: count on all bounces
-                if (bounce == 0 || uniforms.lightCount == 0) {
-                    radiance += throughput * float3(mat.emissiveColor) * mat.emissiveStrength;
+                if (bounce == 0 || previousBounceWasSpecular || uniforms.lightCount == 0) {
+                    radiance += throughput * emission;
                 }
                 break;
             }
 
+            float ndotv = saturate(dot(hitNormal, viewDir));
+            if (ndotv <= 0.0f) {
+                break;
+            }
+
             // ── Next Event Estimation (direct light sampling) ──
-            if (uniforms.lightCount > 0) {
+            if (uniforms.lightCount > 0 && transmissive < 0.99f) {
                 uint lightIdx = min(uint(rng.next() * float(uniforms.lightCount)),
                                     uniforms.lightCount - 1);
                 Light light = lights[lightIdx];
@@ -228,24 +239,57 @@ kernel void pathTraceKernel(
                         float lightArea = light.area;
                         float pdf = 1.0f / (float(uniforms.lightCount) * lightArea);
                         float G = cosTheta * cosLight / (lightDist * lightDist);
-                        float3 brdf = albedo / M_PI_F;
+                        float3 brdf = evaluateCookTorranceBRDF(albedo, roughness, metallic,
+                                                              ior, hitNormal, viewDir, lightDir);
                         radiance += throughput * emission * brdf * G / pdf;
                     }
                 }
             }
 
-            // Lambertian BRDF: throughput *= albedo
-            throughput *= albedo;
+            float3 Fview = fresnelSchlick(ndotv, materialF0(albedo, metallic, ior));
+            float diffuseWeight = max((1.0f - metallic) * (1.0f - transmissive), 0.0f);
+            float specularWeight = max(luminance(Fview), 0.001f);
+            float specularChance = 1.0f;
+            float diffuseChance = 0.0f;
+
+            if (diffuseWeight > 0.0f) {
+                specularChance = specularWeight / (specularWeight + diffuseWeight);
+                specularChance = clamp(specularChance, 0.12f, 0.88f);
+                diffuseChance = 1.0f - specularChance;
+            }
+
+            bool sampleSpecular = diffuseChance <= 0.0f || rng.next() < specularChance;
+            float3 newDir;
+            if (sampleSpecular) {
+                float3 halfVector = sampleGGXHalfVector(hitNormal, roughness, rng.next2());
+                newDir = normalize(reflect(-viewDir, halfVector));
+            } else {
+                newDir = cosineWeightedHemisphere(rng.next2(), hitNormal);
+            }
+
+            float ndotl = saturate(dot(hitNormal, newDir));
+            if (ndotl <= 0.0f) {
+                break;
+            }
+
+            float pdfDiffuse = cosineHemispherePdf(ndotl);
+            float pdfSpecular = ggxPdf(hitNormal, viewDir, newDir, roughness);
+            float totalPdf = diffuseChance * pdfDiffuse + specularChance * pdfSpecular;
+            if (totalPdf <= 1e-6f) {
+                break;
+            }
+
+            float3 brdf = evaluateCookTorranceBRDF(albedo, roughness, metallic,
+                                                  ior, hitNormal, viewDir, newDir);
+            throughput *= brdf * (ndotl / totalPdf);
+            previousBounceWasSpecular = sampleSpecular && roughness < 0.2f;
 
             // Russian roulette after bounce 3
             if (bounce >= 3) {
-                float p = max(throughput.x, max(throughput.y, throughput.z));
+                float p = clamp(max(throughput.x, max(throughput.y, throughput.z)), 0.05f, 0.95f);
                 if (rng.next() > p) break;
                 throughput /= p;
             }
-
-            // Sample next direction (cosine-weighted hemisphere)
-            float3 newDir = cosineWeightedHemisphere(rng.next2(), hitNormal);
 
             r.origin    = hitPoint + hitNormal * 0.001f;
             r.direction = newDir;

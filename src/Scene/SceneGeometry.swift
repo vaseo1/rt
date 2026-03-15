@@ -14,11 +14,15 @@ struct GPUMaterial {
     var albedo: (Float, Float, Float)
     var emissiveStrength: Float
     var emissiveColor: (Float, Float, Float)
+    var roughness: Float
+    var metallic: Float
+    var transmissive: Float
+    var ior: Float
+    var surfaceType: UInt32
     var textureOffset: UInt32
     var textureWidth: UInt32
     var textureHeight: UInt32
     var _pad0: UInt32 = 0
-    var _pad1: UInt32 = 0
 }
 
 struct GPULight {
@@ -85,6 +89,11 @@ class SceneGeometry {
                 albedo: (m.albedo.x, m.albedo.y, m.albedo.z),
                 emissiveStrength: m.emissiveStrength,
                 emissiveColor: (m.emissiveColor.x, m.emissiveColor.y, m.emissiveColor.z),
+                roughness: m.roughness,
+                metallic: m.metallic,
+                transmissive: m.transmissive,
+                ior: m.ior,
+                surfaceType: m.surfaceType,
                 textureOffset: texInfo.0,
                 textureWidth: texInfo.1,
                 textureHeight: texInfo.2
