@@ -127,6 +127,17 @@ class Camera {
         previousViewProjectionMatrix = viewProjectionMatrix
     }
 
+    func lookAt(target: SIMD3<Float>) {
+        let toTarget = target - position
+        let distanceToTarget = length(toTarget)
+        guard distanceToTarget > 0.001 else { return }
+
+        let direction = toTarget / distanceToTarget
+        yaw = atan2(direction.x, -direction.z)
+        pitch = asin(max(-1.0, min(1.0, direction.y)))
+        pitch = max(-.pi / 2.0 + 0.01, min(.pi / 2.0 - 0.01, pitch))
+    }
+
     func resetAccumulation() {
         haltonIndex = 0
     }

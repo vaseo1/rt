@@ -176,4 +176,25 @@ enum ScreenshotCapture {
             height: h
         )
     }
+
+    static func computeMagentaCoverage(texture: MTLTexture, commandQueue: MTLCommandQueue) -> Float {
+        guard let pixels = readPixels(from: texture, commandQueue: commandQueue) else {
+            return 0
+        }
+
+        let totalPixels = max(texture.width * texture.height, 1)
+        var magentaPixels = 0
+
+        for i in stride(from: 0, to: pixels.count, by: 4) {
+            let blue = Float(pixels[i]) / 255.0
+            let green = Float(pixels[i + 1]) / 255.0
+            let red = Float(pixels[i + 2]) / 255.0
+
+            if red > 0.45 && blue > 0.45 && green < min(red, blue) * 0.55 {
+                magentaPixels += 1
+            }
+        }
+
+        return Float(magentaPixels) / Float(totalPixels) * 100.0
+    }
 }

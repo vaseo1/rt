@@ -15,11 +15,16 @@ class Renderer {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let camera = Camera()
+    let verifyConfig: VerifyConfig
 
     private var pathTracer: PathTracer
     private var accelBuilder: AccelStructureBuilder
     private var scene: SceneGeometry
     private var upscaler: MetalFXUpscaler?
+    private let startupCameraPosition: SIMD3<Float>?
+    private let startupLookAtPosition: SIMD3<Float>?
+    private let lookAtWaterOnLoad: Bool
+    private let highlightWater: Bool
 
     // Resolution
     private var outputWidth: Int = 2560
@@ -33,7 +38,6 @@ class Renderer {
     private var sceneLoaded = false
 
     // Verification
-    var verifyConfig = VerifyConfig()
     var pendingScreenshot = false
     private var verifyCompleted = false
     private(set) var captureInProgress = false
@@ -41,9 +45,14 @@ class Renderer {
     private var completedFrames: UInt32 = 0
     private var previousCameraMoving = false
 
-    init(device: MTLDevice, view: GameView) {
+    init(device: MTLDevice, view: GameView, launchConfig: LaunchConfig) {
         self.device = device
         self.commandQueue = device.makeCommandQueue()!
+        self.verifyConfig = launchConfig.verifyConfig
+        self.startupCameraPosition = launchConfig.startPosition
+        self.startupLookAtPosition = launchConfig.lookAtPosition
+        self.lookAtWaterOnLoad = launchConfig.lookAtWater
+        self.highlightWater = launchConfig.highlightWater
 
         self.pathTracer = PathTracer(device: device, commandQueue: commandQueue)
         self.accelBuilder = AccelStructureBuilder(device: device, commandQueue: commandQueue)
@@ -110,9 +119,59 @@ class Renderer {
         // Upload to GPU
         scene.loadFromBSP(data)
 
+        let waterFramingPosition = data.preferredLiquidSurface.map { liquidSurface in
+            let suggestedCameraPosition = liquidSurface.position + liquidSurface.normal * 24.0
+            print(String(format: "[Renderer] Water surface '%@' center=(%.1f, %.1f, %.1f) suggested-camera=(%.1f, %.1f, %.1f)",
+                         liquidSurface.materialName,
+                         liquidSurface.position.x,
+                         liquidSurface.position.y,
+                         liquidSurface.position.z,
+                         suggestedCameraPosition.x,
+                         suggestedCameraPosition.y,
+                         suggestedCameraPosition.z))
+
+            return liquidSurface.position + liquidSurface.normal * 96.0
+        }
+
+        if lookAtWaterOnLoad, startupCameraPosition == nil, let waterFramingPosition {
+            print(String(format: "[Renderer] Water framing camera=(%.1f, %.1f, %.1f)",
+                         waterFramingPosition.x,
+                         waterFramingPosition.y,
+                         waterFramingPosition.z))
+        }
+
         // Set camera to spawn position
-        camera.position = data.spawnPosition
+        if let startupCameraPosition {
+            camera.position = startupCameraPosition
+            print(String(format: "[Renderer] Camera start override=(%.1f, %.1f, %.1f)",
+                         startupCameraPosition.x,
+                         startupCameraPosition.y,
+                         startupCameraPosition.z))
+        } else if lookAtWaterOnLoad, let waterFramingPosition {
+            camera.position = waterFramingPosition
+        } else {
+            camera.position = data.spawnPosition
+        }
         camera.yaw = data.spawnAngle
+
+        if lookAtWaterOnLoad, let liquidSurface = data.preferredLiquidSurface {
+            camera.lookAt(target: liquidSurface.position)
+            camera.focusDistance = length(liquidSurface.position - camera.position)
+            print(String(format: "[Renderer] Camera looking at water center=(%.1f, %.1f, %.1f) focusDistance=%.1f",
+                         liquidSurface.position.x,
+                         liquidSurface.position.y,
+                         liquidSurface.position.z,
+                         camera.focusDistance))
+        } else if let startupLookAtPosition {
+            camera.lookAt(target: startupLookAtPosition)
+            camera.focusDistance = length(startupLookAtPosition - camera.position)
+            print(String(format: "[Renderer] Camera look-at target=(%.1f, %.1f, %.1f) focusDistance=%.1f",
+                         startupLookAtPosition.x,
+                         startupLookAtPosition.y,
+                         startupLookAtPosition.z,
+                         camera.focusDistance))
+        }
+        camera.syncHistory()
 
         // Build acceleration structure
         accelBuilder.build(scene: scene)
@@ -196,7 +255,8 @@ class Renderer {
             outputHeight: UInt32(outputHeight),
             aperture: camera.aperture,
             focusDistance: camera.focusDistance,
-            lightCount: UInt32(scene.lightCount)
+            lightCount: UInt32(scene.lightCount),
+            debugFlags: highlightWater ? 1 : 0
         )
 
         // ── Encode ──
@@ -319,6 +379,11 @@ class Renderer {
         let saved = ScreenshotCapture.capture(texture: texture, commandQueue: commandQueue, to: url)
         let metrics = ScreenshotCapture.computeMetrics(texture: texture, commandQueue: commandQueue)
         metrics.printReport(screenshotPath: saved ? url.path : nil)
+        if highlightWater {
+            let magentaCoverage = ScreenshotCapture.computeMagentaCoverage(texture: texture,
+                                                                           commandQueue: commandQueue)
+            print(String(format: "[VERIFY] magenta_pct: %.2f", magentaCoverage))
+        }
 
         // Exit with appropriate code
         let exitCode: Int32 = metrics.passed ? 0 : 1
@@ -337,6 +402,11 @@ class Renderer {
         let saved = ScreenshotCapture.capture(texture: texture, commandQueue: commandQueue, to: desktopURL)
         let metrics = ScreenshotCapture.computeMetrics(texture: texture, commandQueue: commandQueue)
         metrics.printReport(screenshotPath: saved ? desktopURL.path : nil)
+        if highlightWater {
+            let magentaCoverage = ScreenshotCapture.computeMagentaCoverage(texture: texture,
+                                                                           commandQueue: commandQueue)
+            print(String(format: "[VERIFY] magenta_pct: %.2f", magentaCoverage))
+        }
     }
 
     private func debugDescription(for status: MTLCommandBufferStatus) -> String {
@@ -505,7 +575,8 @@ class Renderer {
             materials: materials,
             entityString: "",
             spawnPosition: SIMD3<Float>(0, 80, 180),
-            spawnAngle: 0
+            spawnAngle: 0,
+            preferredLiquidSurface: nil
         )
     }
 }

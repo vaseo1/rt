@@ -4,7 +4,7 @@ import Metal
 class AppDelegate: NSObject, NSApplicationDelegate {
     var window: NSWindow!
     var renderer: Renderer!
-    var verifyConfig = VerifyConfig()
+    var launchConfig = LaunchConfig()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -24,8 +24,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let gameView = GameView(frame: windowRect, device: device)
         window.contentView = gameView
 
-        renderer = Renderer(device: device, view: gameView)
-        renderer.verifyConfig = verifyConfig
+        renderer = Renderer(device: device, view: gameView, launchConfig: launchConfig)
         gameView.renderer = renderer
 
         window.makeKeyAndOrderFront(nil)
@@ -33,7 +32,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
-        if !verifyConfig.enabled {
+        if !launchConfig.verifyConfig.enabled {
             // Capture mouse for FPS-style control (skip in verify mode)
             gameView.captureMouse()
         }

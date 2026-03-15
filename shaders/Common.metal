@@ -75,6 +75,7 @@ struct Uniforms {
     float    aperture;
     float    focusDistance;
     uint     lightCount;
+    uint     debugFlags;
     uint     _pad0;
     uint     _pad1;
     uint     _pad2;

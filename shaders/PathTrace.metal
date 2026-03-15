@@ -187,7 +187,22 @@ kernel void pathTraceKernel(
             float ior = max(mat.ior, 1.0f);
             float3 viewDir = -r.direction;
             float3 emission = float3(mat.emissiveColor) * mat.emissiveStrength;
+            bool highlightLiquid = ((uniforms.debugFlags & 1u) != 0u) &&
+                                   (mat.surfaceType == SurfaceTypeLiquid);
+            if (highlightLiquid) {
+                albedo = float3(1.0f, 0.0f, 1.0f);
+                roughness = 0.85f;
+                metallic = 0.0f;
+                transmissive = 0.0f;
+                ior = 1.0f;
+                emission = float3(5.0f, 0.0f, 5.0f);
+            }
             bool isTransmissive = transmissive > 0.0f;
+
+            if (highlightLiquid) {
+                radiance += throughput * emission;
+                break;
+            }
 
             // Handle emissive surfaces
             if (mat.emissiveStrength > 0.0f) {

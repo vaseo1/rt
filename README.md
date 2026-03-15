@@ -12,6 +12,21 @@ open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app
 
 Requires macOS 13+, Apple Silicon, Xcode with Metal Toolchain. XcodeGen generates the `.xcodeproj` from `project.yml`. Assets (`.pak`, `.bsp`) are gitignored.
 
+## Startup Arguments
+
+```bash
+open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --start-pos 512 32 -768
+open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --verify --verify-frames 96 --start-pos=512,32,-768
+open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --verify --look-at-water --highlight-water
+```
+
+- `--start-pos x y z` or `--start-pos=x,y,z`: override the BSP spawn position with engine-space coordinates after the map loads.
+- `--look-at x y z` or `--look-at=x,y,z`: orient the camera toward a target point after the start position is applied.
+- `--look-at-water`: aim the camera at the detected water surface; if no explicit start position is given, move to a top-down framing position above it.
+- `--highlight-water`: force liquid materials to bright magenta in the render so they are obvious in screenshots and verify captures.
+- `--verify`, `--verify-frames`, `--verify-output`: existing verification flow, now composable with `--start-pos`.
+- When a BSP contains water, the renderer logs a suggested camera position just above the largest horizontal water surface.
+
 ## Controls
 
 | Key | Action |

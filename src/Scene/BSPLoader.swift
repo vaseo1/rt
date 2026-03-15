@@ -114,6 +114,12 @@ struct ParsedMaterial {
     var texturePixels: [UInt8]?
 }
 
+struct SurfaceAnchor {
+    var materialName: String
+    var position: SIMD3<Float>
+    var normal: SIMD3<Float>
+}
+
 private struct MaterialClassification {
     let surfaceType: UInt32
     let roughness: Float
@@ -129,6 +135,7 @@ struct BSPData {
     var entityString: String
     var spawnPosition: SIMD3<Float>
     var spawnAngle: Float
+    var preferredLiquidSurface: SurfaceAnchor?
 }
 
 // MARK: - BSP Loader
@@ -292,6 +299,9 @@ class BSPLoader {
         // Parse entities for spawn point
         let entityStr = readEntityString()
         let (spawnPos, spawnAngle) = parseSpawnPoint(from: entityStr)
+        let preferredLiquidSurface = findPreferredLiquidSurface(vertices: parsedVertices,
+                                    indices: indices,
+                                    materials: materials)
 
         print("[BSP] Loaded: \(parsedVertices.count) vertices, \(indices.count / 3) triangles, \(materials.count) materials")
 
@@ -301,7 +311,8 @@ class BSPLoader {
             materials: materials,
             entityString: entityStr,
             spawnPosition: spawnPos,
-            spawnAngle: spawnAngle
+            spawnAngle: spawnAngle,
+            preferredLiquidSurface: preferredLiquidSurface
         )
     }
 
@@ -670,6 +681,94 @@ class BSPLoader {
         let dir1 = edge1 / len1
         let cosine = max(-1.0, min(1.0, dot(dir0, dir1)))
         return acos(cosine)
+    }
+
+    private func findPreferredLiquidSurface(vertices: [ParsedVertex],
+                                            indices: [UInt32],
+                                            materials: [ParsedMaterial]) -> SurfaceAnchor? {
+        findPreferredLiquidSurface(vertices: vertices,
+                                   indices: indices,
+                                   materials: materials,
+                                   waterOnly: true)
+        ?? findPreferredLiquidSurface(vertices: vertices,
+                                     indices: indices,
+                                     materials: materials,
+                                     waterOnly: false)
+    }
+
+    private func findPreferredLiquidSurface(vertices: [ParsedVertex],
+                                            indices: [UInt32],
+                                            materials: [ParsedMaterial],
+                                            waterOnly: Bool) -> SurfaceAnchor? {
+        struct LiquidCluster {
+            var materialName: String
+            var totalArea: Float
+            var weightedPosition: SIMD3<Float>
+            var weightedNormal: SIMD3<Float>
+        }
+
+        var clusters: [String: LiquidCluster] = [:]
+
+        for tri in stride(from: 0, to: indices.count, by: 3) {
+            let i0 = Int(indices[tri])
+            let i1 = Int(indices[tri + 1])
+            let i2 = Int(indices[tri + 2])
+
+            guard i0 < vertices.count, i1 < vertices.count, i2 < vertices.count else { continue }
+
+            let materialIndex = Int(vertices[i0].materialIndex)
+            guard materialIndex < materials.count else { continue }
+            let material = materials[materialIndex]
+            let materialName = material.name.lowercased()
+
+            if waterOnly {
+                guard materialName.hasPrefix("*water") else { continue }
+            } else {
+                guard material.surfaceType == MaterialSurfaceType.liquid.rawValue else { continue }
+            }
+
+            let p0 = vertices[i0].position
+            let p1 = vertices[i1].position
+            let p2 = vertices[i2].position
+            let crossProduct = cross(p1 - p0, p2 - p0)
+            let area = length(crossProduct) * 0.5
+            guard area > 1.0 else { continue }
+
+            let normalLength = length(crossProduct)
+            guard normalLength > 0.0001 else { continue }
+
+            var normal = crossProduct / normalLength
+            guard abs(normal.y) > 0.8 else { continue }
+            if normal.y < 0 {
+                normal = -normal
+            }
+
+            let center = (p0 + p1 + p2) / 3.0
+            let clusterKey = "\(materialName)@\(Int(round(center.y)))"
+            var cluster = clusters[clusterKey] ?? LiquidCluster(materialName: material.name,
+                                                                totalArea: 0,
+                                                                weightedPosition: .zero,
+                                                                weightedNormal: .zero)
+            cluster.totalArea += area
+            cluster.weightedPosition += center * area
+            cluster.weightedNormal += normal * area
+            clusters[clusterKey] = cluster
+        }
+
+        guard let bestCluster = clusters.values.max(by: { $0.totalArea < $1.totalArea }) else {
+            return nil
+        }
+
+        let safeArea = max(bestCluster.totalArea, 0.0001)
+        let anchorPosition = bestCluster.weightedPosition / safeArea
+        let weightedNormalLength = length(bestCluster.weightedNormal)
+        let anchorNormal = weightedNormalLength > 0.0001
+            ? bestCluster.weightedNormal / weightedNormalLength
+            : SIMD3<Float>(0, 1, 0)
+
+        return SurfaceAnchor(materialName: bestCluster.materialName,
+                             position: anchorPosition,
+                             normal: anchorNormal)
     }
 
     private func parseSpawnPoint(from entityStr: String) -> (SIMD3<Float>, Float) {

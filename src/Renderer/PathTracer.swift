@@ -24,6 +24,7 @@ struct Uniforms {
     var aperture: Float
     var focusDistance: Float
     var lightCount: UInt32
+    var debugFlags: UInt32
     var _pad0: UInt32 = 0
     var _pad1: UInt32 = 0
     var _pad2: UInt32 = 0
