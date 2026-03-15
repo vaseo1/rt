@@ -1,0 +1,27 @@
+name: rt
+options:
+  bundleIdPrefix: dev.rt
+  deploymentTarget:
+    macOS: "13.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    MACOSX_DEPLOYMENT_TARGET: "13.0"
+    ARCHS: arm64
+
+targets:
+  rt:
+    type: application
+    platform: macOS
+    sources:
+      - src
+      - shaders
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: dev.rt.pathtracer
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_NAME: rt
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+    dependencies: []
