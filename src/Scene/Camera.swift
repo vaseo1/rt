@@ -31,7 +31,7 @@ class Camera {
 
         // Mouse look
         let hasMouseInput = abs(mouseDeltaX) > 0.5 || abs(mouseDeltaY) > 0.5
-        yaw -= mouseDeltaX * mouseSensitivity
+        yaw += mouseDeltaX * mouseSensitivity
         pitch -= mouseDeltaY * mouseSensitivity
         pitch = max(-.pi / 2.0 + 0.01, min(.pi / 2.0 - 0.01, pitch))
 
