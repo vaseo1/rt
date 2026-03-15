@@ -2,6 +2,33 @@ import AppKit
 import Foundation
 import simd
 
+enum RenderMode: String, CaseIterable {
+    case auto
+    case raw
+    case accumulation
+    case svgf
+    case metalfx
+
+    var displayName: String {
+        switch self {
+        case .auto:
+            return "Auto"
+        case .raw:
+            return "Raw"
+        case .accumulation:
+            return "Accumulation"
+        case .svgf:
+            return "SVGF"
+        case .metalfx:
+            return "MetalFX"
+        }
+    }
+
+    static var argumentList: String {
+        allCases.map(\.rawValue).joined(separator: ", ")
+    }
+}
+
 // Parse startup CLI flags
 struct VerifyConfig {
     var enabled = false
@@ -15,6 +42,7 @@ struct LaunchConfig {
     var lookAtPosition: SIMD3<Float>?
     var lookAtWater = false
     var highlightWater = false
+    var renderMode: RenderMode = .auto
 }
 
 private func failArgumentParsing(_ message: String) -> Never {
@@ -81,6 +109,13 @@ func parseLaunchArgs() -> LaunchConfig {
             config.lookAtWater = true
         case "--highlight-water":
             config.highlightWater = true
+        case "--render-mode":
+            guard index + 1 < args.count,
+                  let renderMode = RenderMode(rawValue: args[index + 1].lowercased()) else {
+                failArgumentParsing("--render-mode requires one of: \(RenderMode.argumentList)")
+            }
+            config.renderMode = renderMode
+            index += 1
         default:
             if arg.hasPrefix("--start-pos=") || arg.hasPrefix("--start-position=") {
                 let components = arg.split(separator: "=", maxSplits: 1)
@@ -96,6 +131,13 @@ func parseLaunchArgs() -> LaunchConfig {
                     failArgumentParsing("\(arg) must be in the form --look-at=x,y,z")
                 }
                 config.lookAtPosition = lookAtPosition
+            } else if arg.hasPrefix("--render-mode=") {
+                let components = arg.split(separator: "=", maxSplits: 1)
+                guard components.count == 2,
+                      let renderMode = RenderMode(rawValue: String(components[1]).lowercased()) else {
+                    failArgumentParsing("\(arg) must be one of: \(RenderMode.argumentList)")
+                }
+                config.renderMode = renderMode
             }
         }
 

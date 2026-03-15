@@ -68,6 +68,8 @@ struct Uniforms {
     uint     maxBounces;
     float    jitterX;
     float    jitterY;
+    float    previousJitterX;
+    float    previousJitterY;
     uint     renderWidth;
     uint     renderHeight;
     uint     outputWidth;

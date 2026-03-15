@@ -41,6 +41,8 @@ struct Uniforms {
     var maxBounces: UInt32
     var jitterX: Float
     var jitterY: Float
+    var previousJitterX: Float
+    var previousJitterY: Float
     var renderWidth: UInt32
     var renderHeight: UInt32
     var outputWidth: UInt32
@@ -68,9 +70,12 @@ class PathTracer {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     private let bloomSettings = BloomSettings()
+    private let svgfStepWidths: [UInt32] = [1, 2, 4, 8]
 
     private var pathTracePipeline: MTLComputePipelineState!
     private var accumulatePipeline: MTLComputePipelineState!
+    private var svgfTemporalPipeline: MTLComputePipelineState!
+    private var svgfATrousPipeline: MTLComputePipelineState!
     private var measureExposurePipeline: MTLComputePipelineState!
     private var extractBloomPipeline: MTLComputePipelineState!
     private var blurBloomPipeline: MTLComputePipelineState!
@@ -82,8 +87,21 @@ class PathTracer {
     private(set) var colorTexture: MTLTexture?
     private(set) var depthTexture: MTLTexture?
     private(set) var motionTexture: MTLTexture?
+    private(set) var normalTexture: MTLTexture?
+    private(set) var albedoTexture: MTLTexture?
     private(set) var historyTexture: MTLTexture?
     private(set) var accumulatedTexture: MTLTexture?
+    private(set) var svgfTemporalTexture: MTLTexture?
+    private(set) var svgfMomentsTexture: MTLTexture?
+    private(set) var svgfHistoryMomentsTexture: MTLTexture?
+    private(set) var svgfHistoryLengthTexture: MTLTexture?
+    private(set) var svgfHistoryLengthScratchTexture: MTLTexture?
+    private(set) var svgfHistoryDepthTexture: MTLTexture?
+    private(set) var svgfHistoryNormalTexture: MTLTexture?
+    private(set) var svgfHistoryAlbedoTexture: MTLTexture?
+    private(set) var svgfPingTexture: MTLTexture?
+    private(set) var svgfPongTexture: MTLTexture?
+    private(set) var svgfFilteredTexture: MTLTexture?
     private(set) var bloomTexture: MTLTexture?
     private(set) var bloomScratchTexture: MTLTexture?
     private(set) var bloomCompositeTexture: MTLTexture?
@@ -106,6 +124,17 @@ class PathTracer {
         buildPipelines()
     }
 
+    private struct SVGFATrousUniforms {
+        var renderWidth: UInt32
+        var renderHeight: UInt32
+        var stepWidth: UInt32
+        var passIndex: UInt32
+        var colorPhiScale: Float
+        var normalPhi: Float
+        var depthPhi: Float
+        var albedoPhi: Float
+    }
+
     private func buildPipelines() {
         guard let library = device.makeDefaultLibrary() else {
             fatalError("Failed to load Metal library. Ensure .metal files are in the Xcode target.")
@@ -124,6 +153,8 @@ class PathTracer {
 
         pathTracePipeline = makePipeline("pathTraceKernel")
         accumulatePipeline = makePipeline("accumulateKernel")
+        svgfTemporalPipeline = makePipeline("svgfTemporalKernel")
+        svgfATrousPipeline = makePipeline("svgfATrousKernel")
         measureExposurePipeline = makePipeline("measureExposureKernel")
         extractBloomPipeline = makePipeline("extractBloomKernel")
         blurBloomPipeline = makePipeline("blurBloomKernel")
@@ -152,11 +183,24 @@ class PathTracer {
             return device.makeTexture(descriptor: desc)!
         }
 
-        colorTexture       = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
-        depthTexture        = makeTexture(renderWidth, renderHeight, format: .r32Float)
-        motionTexture       = makeTexture(renderWidth, renderHeight, format: .rg16Float)
-        historyTexture      = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
-        accumulatedTexture  = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        colorTexture = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        depthTexture = makeTexture(renderWidth, renderHeight, format: .r32Float)
+        motionTexture = makeTexture(renderWidth, renderHeight, format: .rg16Float)
+        normalTexture = makeTexture(renderWidth, renderHeight, format: .rgba16Float)
+        albedoTexture = makeTexture(renderWidth, renderHeight, format: .rgba16Float)
+        historyTexture = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        accumulatedTexture = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        svgfTemporalTexture = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        svgfMomentsTexture = makeTexture(renderWidth, renderHeight, format: .rg32Float)
+        svgfHistoryMomentsTexture = makeTexture(renderWidth, renderHeight, format: .rg32Float)
+        svgfHistoryLengthTexture = makeTexture(renderWidth, renderHeight, format: .r16Float)
+        svgfHistoryLengthScratchTexture = makeTexture(renderWidth, renderHeight, format: .r16Float)
+        svgfHistoryDepthTexture = makeTexture(renderWidth, renderHeight, format: .r32Float)
+        svgfHistoryNormalTexture = makeTexture(renderWidth, renderHeight, format: .rgba16Float)
+        svgfHistoryAlbedoTexture = makeTexture(renderWidth, renderHeight, format: .rgba16Float)
+        svgfPingTexture = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        svgfPongTexture = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        svgfFilteredTexture = nil
         let bloomWidth = max(1, (outputWidth + 1) / 2)
         let bloomHeight = max(1, (outputHeight + 1) / 2)
         bloomTexture = makeTexture(bloomWidth, bloomHeight, format: .rgba16Float)
@@ -179,6 +223,8 @@ class PathTracer {
         guard let colorTex = colorTexture,
               let depthTex = depthTexture,
               let motionTex = motionTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
               let vertexBuf = scene.vertexBuffer,
               let indexBuf = scene.indexBuffer,
               let materialBuf = scene.materialBuffer,
@@ -206,6 +252,8 @@ class PathTracer {
             encoder.setTexture(colorTex, index: 0)
             encoder.setTexture(depthTex, index: 1)
             encoder.setTexture(motionTex, index: 2)
+            encoder.setTexture(normalTex, index: 3)
+            encoder.setTexture(albedoTex, index: 4)
 
             let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
             let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
@@ -254,6 +302,111 @@ class PathTracer {
             blit.copy(from: accumTex, to: historyTex)
             blit.endEncoding()
         }
+    }
+
+    func encodeSVGF(commandBuffer: MTLCommandBuffer,
+                    uniforms: inout Uniforms) -> MTLTexture? {
+        guard let colorTex = colorTexture,
+              let depthTex = depthTexture,
+              let motionTex = motionTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
+              let temporalTex = svgfTemporalTexture,
+              let momentsTex = svgfMomentsTexture,
+              let historyMomentsTex = svgfHistoryMomentsTexture,
+              let historyLengthTex = svgfHistoryLengthTexture,
+              let historyLengthScratchTex = svgfHistoryLengthScratchTexture,
+              let historyDepthTex = svgfHistoryDepthTexture,
+              let historyNormalTex = svgfHistoryNormalTexture,
+              let historyAlbedoTex = svgfHistoryAlbedoTexture,
+              let historyTex = historyTexture,
+              let pingTex = svgfPingTexture,
+              let pongTex = svgfPongTexture else {
+            return nil
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+        let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "SVGF Temporal"
+            encoder.setComputePipelineState(svgfTemporalPipeline)
+            encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 0)
+            encoder.setTexture(colorTex, index: 0)
+            encoder.setTexture(depthTex, index: 1)
+            encoder.setTexture(motionTex, index: 2)
+            encoder.setTexture(normalTex, index: 3)
+            encoder.setTexture(albedoTex, index: 4)
+            encoder.setTexture(historyTex, index: 5)
+            encoder.setTexture(historyMomentsTex, index: 6)
+            encoder.setTexture(historyLengthTex, index: 7)
+            encoder.setTexture(historyDepthTex, index: 8)
+            encoder.setTexture(historyNormalTex, index: 9)
+            encoder.setTexture(historyAlbedoTex, index: 10)
+            encoder.setTexture(temporalTex, index: 11)
+            encoder.setTexture(momentsTex, index: 12)
+            encoder.setTexture(historyLengthScratchTex, index: 13)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        var filterUniforms = SVGFATrousUniforms(
+            renderWidth: uniforms.renderWidth,
+            renderHeight: uniforms.renderHeight,
+            stepWidth: 1,
+            passIndex: 0,
+            colorPhiScale: 6.0,
+            normalPhi: 48.0,
+            depthPhi: 64.0,
+            albedoPhi: 8.0
+        )
+
+        var sourceTexture: MTLTexture = temporalTex
+        var targetTexture: MTLTexture = pingTex
+
+        for (passIndex, stepWidth) in svgfStepWidths.enumerated() {
+            filterUniforms.stepWidth = stepWidth
+            filterUniforms.passIndex = UInt32(passIndex)
+
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "SVGF A-Trous \(passIndex)"
+                encoder.setComputePipelineState(svgfATrousPipeline)
+                encoder.setBytes(&filterUniforms,
+                                 length: MemoryLayout<SVGFATrousUniforms>.size,
+                                 index: 0)
+                encoder.setTexture(sourceTexture, index: 0)
+                encoder.setTexture(momentsTex, index: 1)
+                encoder.setTexture(depthTex, index: 2)
+                encoder.setTexture(normalTex, index: 3)
+                encoder.setTexture(albedoTex, index: 4)
+                encoder.setTexture(targetTexture, index: 5)
+                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                encoder.endEncoding()
+            }
+
+            let previousTarget = targetTexture
+            sourceTexture = previousTarget
+            targetTexture = (previousTarget === pingTex) ? pongTex : pingTex
+        }
+
+        svgfFilteredTexture = sourceTexture
+
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.label = "SVGF History Update"
+            if let svgfFilteredTexture {
+                blit.copy(from: svgfFilteredTexture, to: historyTex)
+            }
+            blit.copy(from: momentsTex, to: historyMomentsTex)
+            blit.copy(from: historyLengthScratchTex, to: historyLengthTex)
+            blit.copy(from: depthTex, to: historyDepthTex)
+            blit.copy(from: normalTex, to: historyNormalTex)
+            blit.copy(from: albedoTex, to: historyAlbedoTex)
+            blit.endEncoding()
+        }
+
+        return svgfFilteredTexture
     }
 
     func encodeExposureMeasurement(commandBuffer: MTLCommandBuffer,

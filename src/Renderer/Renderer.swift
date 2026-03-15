@@ -8,7 +8,7 @@ import simd
 //
 // Orchestrates the full render pipeline:
 //   1. Path trace at full resolution, 8 bounces
-//   2. MetalFX temporal filtering while moving, accumulation while still
+//   2. Route through raw, accumulation, SVGF, or MetalFX based on render mode
 //   3. Tonemap + present to drawable
 
 class Renderer {
@@ -16,6 +16,8 @@ class Renderer {
     let commandQueue: MTLCommandQueue
     let camera = Camera()
     let verifyConfig: VerifyConfig
+    private(set) var selectedRenderMode: RenderMode
+    private(set) var activeRenderMode: RenderMode
 
     private var pathTracer: PathTracer
     private var accelBuilder: AccelStructureBuilder
@@ -53,11 +55,14 @@ class Renderer {
     private var submittedFrames: UInt32 = 0
     private var completedFrames: UInt32 = 0
     private var previousCameraMoving = false
+    private var previousJitter = SIMD2<Float>(repeating: 0)
 
     init(device: MTLDevice, view: GameView, launchConfig: LaunchConfig) {
         self.device = device
         self.commandQueue = device.makeCommandQueue()!
         self.verifyConfig = launchConfig.verifyConfig
+        self.selectedRenderMode = launchConfig.renderMode
+        self.activeRenderMode = launchConfig.renderMode
         self.startupCameraPosition = launchConfig.startPosition
         self.startupLookAtPosition = launchConfig.lookAtPosition
         self.lookAtWaterOnLoad = launchConfig.lookAtWater
@@ -73,6 +78,45 @@ class Renderer {
         outputHeight = Int(view.bounds.height * scale)
 
         loadScene()
+    }
+
+    var renderModeTitle: String {
+        if selectedRenderMode == .auto {
+            return "Auto/\(activeRenderMode.displayName)"
+        }
+
+        if selectedRenderMode != activeRenderMode {
+            return "\(selectedRenderMode.displayName)->\(activeRenderMode.displayName)"
+        }
+
+        return activeRenderMode.displayName
+    }
+
+    var renderModeDetail: String {
+        switch activeRenderMode {
+        case .raw:
+            return "1 spp"
+        case .accumulation:
+            return "\(max(accumulationCount, 1)) spp"
+        case .svgf, .metalfx:
+            return "\(max(accumulationCount, 1)) history"
+        case .auto:
+            return "\(max(accumulationCount, 1)) history"
+        }
+    }
+
+    func cycleRenderMode() {
+        guard let currentIndex = RenderMode.allCases.firstIndex(of: selectedRenderMode) else {
+            return
+        }
+
+        let nextIndex = RenderMode.allCases.index(after: currentIndex)
+        selectedRenderMode = nextIndex == RenderMode.allCases.endIndex
+            ? RenderMode.allCases[0]
+            : RenderMode.allCases[nextIndex]
+        activeRenderMode = selectedRenderMode
+        resetTemporalState(syncCameraHistory: true)
+        print("[Renderer] Render mode: \(selectedRenderMode.displayName)")
     }
 
     // MARK: - Scene Loading
@@ -201,6 +245,7 @@ class Renderer {
         sceneLoaded = (accelBuilder.accelerationStructure != nil)
 
         if sceneLoaded {
+            previousJitter = camera.jitterOffset
             print("[Renderer] Scene ready!")
         }
     }
@@ -234,6 +279,7 @@ class Renderer {
                                  outputWidth: outputWidth, outputHeight: outputHeight)
         if texturesChanged {
             camera.syncHistory()
+            previousJitter = jitter
             accumulationCount = 0
             upscaler?.reset()
         }
@@ -243,17 +289,32 @@ class Renderer {
                             outputWidth: outputWidth,
                             outputHeight: outputHeight)
 
+        let effectiveRenderMode = resolvedRenderMode(isMoving: isMoving)
+        activeRenderMode = effectiveRenderMode
+
         // ── Accumulation logic ──
-        if isMoving {
-            if startedMoving {
+        switch effectiveRenderMode {
+        case .raw:
+            accumulationCount = 0
+        case .accumulation:
+            if isMoving {
                 accumulationCount = 0
-                upscaler?.reset()
+            } else {
+                accumulationCount += 1
             }
-        } else {
-            if stoppedMoving {
+        case .svgf:
+            if selectedRenderMode == .auto && stoppedMoving {
                 accumulationCount = 0
             }
             accumulationCount += 1
+        case .metalfx:
+            if selectedRenderMode == .auto && startedMoving {
+                accumulationCount = 0
+                upscaler?.reset()
+            }
+            accumulationCount += 1
+        case .auto:
+            accumulationCount = 0
         }
 
         // ── Build uniforms ──
@@ -275,6 +336,8 @@ class Renderer {
             maxBounces: 8,
             jitterX: jitter.x,
             jitterY: jitter.y,
+            previousJitterX: previousJitter.x,
+            previousJitterY: previousJitter.y,
             renderWidth: UInt32(renderW),
             renderHeight: UInt32(renderH),
             outputWidth: UInt32(outputWidth),
@@ -312,7 +375,18 @@ class Renderer {
                                    scene: scene)
 
         let hdrSource: MTLTexture?
-        if isMoving {
+        switch effectiveRenderMode {
+        case .raw:
+            hdrSource = pathTracer.colorTexture
+        case .accumulation:
+            pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
+                                          uniforms: &uniforms)
+            pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
+            hdrSource = pathTracer.accumulatedTexture
+        case .svgf:
+            hdrSource = pathTracer.encodeSVGF(commandBuffer: commandBuffer,
+                                              uniforms: &uniforms) ?? pathTracer.colorTexture
+        case .metalfx:
             if let upscaler,
                let colorTexture = pathTracer.colorTexture,
                let depthTexture = pathTracer.depthTexture,
@@ -327,11 +401,8 @@ class Renderer {
             } else {
                 hdrSource = pathTracer.colorTexture
             }
-        } else {
-            pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
-                                          uniforms: &uniforms)
-            pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
-            hdrSource = pathTracer.accumulatedTexture
+        case .auto:
+            hdrSource = pathTracer.colorTexture
         }
 
         let hasExposureMeasurement = hdrSource != nil
@@ -345,6 +416,7 @@ class Renderer {
                                      sourceTexture: tonemapSource)
         }
         previousCameraMoving = isMoving
+        previousJitter = jitter
 
         // ── Present ──
         guard let tonemapped = pathTracer.tonemappedTexture else { return }
@@ -418,8 +490,7 @@ class Renderer {
     func resize(width: Int, height: Int) {
         outputWidth = max(1, width)
         outputHeight = max(1, height)
-        accumulationCount = 0
-        upscaler?.reset()
+        resetTemporalState(syncCameraHistory: true)
     }
 
     // MARK: - Screenshot & Verification
@@ -485,6 +556,30 @@ class Renderer {
         let safeLuminance = max(averageLuminance, 1e-4)
         let targetExposure = exposureKeyValue / safeLuminance
         return min(max(targetExposure, minAutoExposure), maxAutoExposure)
+    }
+
+    private func resolvedRenderMode(isMoving: Bool) -> RenderMode {
+        let requestedMode: RenderMode
+        if selectedRenderMode == .auto {
+            requestedMode = isMoving ? .metalfx : .svgf
+        } else {
+            requestedMode = selectedRenderMode
+        }
+
+        if requestedMode == .metalfx && upscaler?.isAvailable != true {
+            return .raw
+        }
+
+        return requestedMode
+    }
+
+    private func resetTemporalState(syncCameraHistory: Bool) {
+        accumulationCount = 0
+        upscaler?.reset()
+        previousJitter = camera.jitterOffset
+        if syncCameraHistory {
+            camera.syncHistory()
+        }
     }
 
     // MARK: - Helpers

@@ -27,6 +27,7 @@ class GameView: NSView, CALayerDelegate {
     private let keySpace: UInt16 = 49
     private let keyLeftShift: UInt16 = 56
     private let keyRightShift: UInt16 = 60
+    private let keyM: UInt16 = 46
     private let keyF12: UInt16 = 111
 
     init(frame: NSRect, device: MTLDevice) {
@@ -167,8 +168,7 @@ class GameView: NSView, CALayerDelegate {
         }
 
         // Update title with stats
-        let spp = max(renderer.accumulationCount, 1)
-        window?.title = String(format: "RT Path Tracer — %d spp", spp)
+        window?.title = "RT Path Tracer — \(renderer.renderModeTitle) — \(renderer.renderModeDetail)"
     }
 
     deinit {
@@ -180,16 +180,22 @@ class GameView: NSView, CALayerDelegate {
     // MARK: - Keyboard Input
 
     override func keyDown(with event: NSEvent) {
-        keysPressed.insert(event.keyCode)
         if event.keyCode == keyEscape {
             if mouseCaptured {
                 releaseMouse()
             } else {
                 NSApp.terminate(nil)
             }
+        } else if event.keyCode == keyM {
+            if !event.isARepeat {
+                renderer?.cycleRenderMode()
+            }
+            return
         } else if event.keyCode == keyF12 {
             renderer?.pendingScreenshot = true
         }
+
+        keysPressed.insert(event.keyCode)
     }
 
     override func keyUp(with event: NSEvent) {

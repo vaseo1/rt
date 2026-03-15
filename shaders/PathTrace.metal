@@ -58,7 +58,9 @@ kernel void pathTraceKernel(
     device   Light*                           lights            [[buffer(6)]],
     texture2d<float, access::write>           colorOutput       [[texture(0)]],
     texture2d<float, access::write>           depthOutput       [[texture(1)]],
-    texture2d<float, access::write>           motionOutput      [[texture(2)]]
+    texture2d<float, access::write>           motionOutput      [[texture(2)]],
+    texture2d<float, access::write>           normalOutput      [[texture(3)]],
+    texture2d<float, access::write>           albedoOutput      [[texture(4)]]
 ) {
     if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) return;
 
@@ -69,7 +71,11 @@ kernel void pathTraceKernel(
     float3 totalRadiance = float3(0.0f);
     float  totalDepth    = 0.0f;
     float2 totalMotion   = float2(0.0f);
+    float3 totalNormal   = float3(0.0f);
+    float3 totalAlbedo   = float3(0.0f);
+    float  totalRoughness = 0.0f;
     uint   motionSamples = 0;
+    uint   surfaceSamples = 0;
 
     for (uint s = 0; s < uniforms.samplesPerPixel; s++) {
         RNG rng(tid, uniforms.frameIndex, s);
@@ -112,6 +118,9 @@ kernel void pathTraceKernel(
         float3 throughput = float3(1.0f);
         float  primaryDepth = 1.0f;
         float2 primaryMotion = float2(0.0f);
+        float3 primaryNormal = float3(0.0f);
+        float3 primaryAlbedo = float3(0.0f);
+        float  primaryRoughness = 0.0f;
         bool   hasPrimaryHit = false;
         bool   previousBounceWasSpecular = false;
 
@@ -210,6 +219,12 @@ kernel void pathTraceKernel(
                 emission = float3(5.0f, 0.0f, 5.0f);
             }
             bool isTransmissive = transmissive > 0.0f;
+
+            if (bounce == 0) {
+                primaryNormal = hitNormal;
+                primaryAlbedo = saturate(albedo);
+                primaryRoughness = roughness;
+            }
 
             if (highlightLiquid) {
                 radiance += throughput * emission;
@@ -373,6 +388,10 @@ kernel void pathTraceKernel(
         if (hasPrimaryHit) {
             totalMotion += primaryMotion;
             motionSamples += 1;
+            totalNormal += primaryNormal;
+            totalAlbedo += primaryAlbedo;
+            totalRoughness += primaryRoughness;
+            surfaceSamples += 1;
         }
     }
 
@@ -380,8 +399,14 @@ kernel void pathTraceKernel(
     float3 finalColor = totalRadiance * invSpp;
     float  finalDepth = totalDepth * invSpp;
     float2 finalMotion = motionSamples > 0 ? totalMotion / float(motionSamples) : float2(0.0f);
+    float3 finalNormal = surfaceSamples > 0 ? normalize(totalNormal / float(surfaceSamples)) : float3(0.0f);
+    float3 finalAlbedo = surfaceSamples > 0 ? totalAlbedo / float(surfaceSamples) : float3(0.0f);
+    float  finalRoughness = surfaceSamples > 0 ? totalRoughness / float(surfaceSamples) : 0.0f;
+    float  hasSurface = surfaceSamples > 0 ? 1.0f : 0.0f;
 
     colorOutput.write(float4(finalColor, 1.0f), tid);
     depthOutput.write(float4(finalDepth, 0.0f, 0.0f, 1.0f), tid);
     motionOutput.write(float4(finalMotion, 0.0f, 1.0f), tid);
+    normalOutput.write(float4(finalNormal, hasSurface), tid);
+    albedoOutput.write(float4(finalAlbedo, finalRoughness), tid);
 }

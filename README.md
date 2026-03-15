@@ -1,6 +1,6 @@
 # rt — Real-Time Path Tracer
 
-Metal ray tracing engine for Apple Silicon. Loads Quake 1 BSP maps, renders with Monte Carlo path tracing + temporal accumulation for converging global illumination.
+Metal ray tracing engine for Apple Silicon. Loads Quake 1 BSP maps, renders with Monte Carlo path tracing, uses SVGF denoising for still frames, and keeps MetalFX temporal filtering available while moving.
 
 ## Quick Start
 
@@ -18,12 +18,14 @@ Requires macOS 13+, Apple Silicon, Xcode with Metal Toolchain. XcodeGen generate
 open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --start-pos 512 32 -768
 open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --verify --verify-frames 96 --start-pos=512,32,-768
 open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --verify --look-at-water --highlight-water
+open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --render-mode svgf
 ```
 
 - `--start-pos x y z` or `--start-pos=x,y,z`: override the BSP spawn position with engine-space coordinates after the map loads.
 - `--look-at x y z` or `--look-at=x,y,z`: orient the camera toward a target point after the start position is applied.
 - `--look-at-water`: aim the camera at the detected water surface; if no explicit start position is given, move to a top-down framing position above it.
 - `--highlight-water`: force liquid materials to bright magenta in the render so they are obvious in screenshots and verify captures.
+- `--render-mode auto|raw|accumulation|svgf|metalfx`: choose the presentation path explicitly. `auto` uses SVGF while still and MetalFX while moving.
 - `--verify`, `--verify-frames`, `--verify-output`: existing verification flow, now composable with `--start-pos`.
 - When a BSP contains water, the renderer logs a suggested camera position just above the largest horizontal water surface.
 
@@ -35,6 +37,7 @@ open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --ar
 | Shift + WASD | Move faster |
 | Mouse | Look |
 | Space | Up |
+| M | Cycle render mode |
 | Escape | Release cursor / Quit |
 
 ## Architecture
@@ -65,11 +68,11 @@ shaders/
 ## GPU Pipeline
 
 ```
-pathTraceKernel → accumulateKernel or MetalFX → bloom → tonemapKernel → blit to drawable
+pathTraceKernel → SVGF or MetalFX → bloom → tonemapKernel → blit to drawable
 ```
 
-- **Path trace**: 1 spp/frame, Lambertian BRDF, cosine-weighted hemisphere, Russian roulette after bounce 3. Outputs HDR color + depth + motion vectors.
-- **Accumulate**: running average `mix(history, current, 1/N)`. Resets on camera move.
+- **Path trace**: 1 spp/frame, Lambertian BRDF, cosine-weighted hemisphere, Russian roulette after bounce 3. Outputs HDR color + depth + motion vectors plus normal/albedo G-buffers.
+- **SVGF**: temporal reprojection with history rejection, luminance moments, then 4 a-trous passes over depth, normal, luminance, and albedo.
 - **Bloom**: thresholds bright HDR highlights, blurs at half resolution, composites before tonemap.
 - **Tonemap**: ACES filmic + sRGB gamma, firefly clamp at luminance 50.
 

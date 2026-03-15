@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		04798D471DE7E705F85F610B /* Denoise.metal in Sources */ = {isa = PBXBuildFile; fileRef = F04A545C68917D3FCDB99175 /* Denoise.metal */; };
 		1C293F259E01D2255E0CFA77 /* AccelStructure.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2A7DAFCFDAE3640846AC3D /* AccelStructure.swift */; };
 		2D591D814F7E76ECFF681E82 /* Common.metal in Sources */ = {isa = PBXBuildFile; fileRef = 66EF89AC761B051B352CEF25 /* Common.metal */; };
 		32A5E65E2B58264B9E7F7C19 /* ScreenshotCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 728DC2B94DAC3133F2B84CB6 /* ScreenshotCapture.swift */; };
@@ -39,6 +40,7 @@
 		EBF55833F79D9E9255184B0F /* Camera.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Camera.swift; sourceTree = "<group>"; };
 		EE2A7DAFCFDAE3640846AC3D /* AccelStructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccelStructure.swift; sourceTree = "<group>"; };
 		EE4C2D668FD6B837B7E59230 /* Bloom.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Bloom.metal; sourceTree = "<group>"; };
+		F04A545C68917D3FCDB99175 /* Denoise.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Denoise.metal; sourceTree = "<group>"; };
 		FF2E9F6E08FBB140B9C3AC54 /* PathTrace.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = PathTrace.metal; sourceTree = "<group>"; };
 		FFE99989E1E08FBD1F155D84 /* BSPLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BSPLoader.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -72,6 +74,7 @@
 				04DEF86BD1A13493DB6B1BE5 /* Accumulate.metal */,
 				EE4C2D668FD6B837B7E59230 /* Bloom.metal */,
 				66EF89AC761B051B352CEF25 /* Common.metal */,
+				F04A545C68917D3FCDB99175 /* Denoise.metal */,
 				FF2E9F6E08FBB140B9C3AC54 /* PathTrace.metal */,
 			);
 			path = shaders;
@@ -187,6 +190,7 @@
 				487B5B24548BCE34B3E00556 /* Bloom.metal in Sources */,
 				C08DFD9E01073BE9845D0529 /* Camera.swift in Sources */,
 				2D591D814F7E76ECFF681E82 /* Common.metal in Sources */,
+				04798D471DE7E705F85F610B /* Denoise.metal in Sources */,
 				FA3730B75F9BE163AF304FFE /* GameView.swift in Sources */,
 				C593BB199968ECFD298F1EE0 /* MetalFXUpscaler.swift in Sources */,
 				8321218655436168B81A45AB /* PathTrace.metal in Sources */,
