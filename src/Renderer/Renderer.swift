@@ -36,6 +36,7 @@ class Renderer {
     private let maxAutoExposure: Float = 8.0
     private let darkToBrightAdaptationRate: Float = 3.0
     private let brightToDarkAdaptationRate: Float = 1.35
+    private let metalFXRenderScale: Float = 0.67
 
     // Resolution
     private var outputWidth: Int = 2560
@@ -259,10 +260,6 @@ class Renderer {
             return
         }
 
-        // ── Render resolution ──
-        let renderW = outputWidth
-        let renderH = outputHeight
-
         camera.aspectRatio = Float(outputWidth) / Float(outputHeight)
         let isMoving = camera.isMoving
         let startedMoving = isMoving && !previousCameraMoving
@@ -273,6 +270,12 @@ class Renderer {
         let exposureDeltaTime = min(max(Float(now - lastExposureUpdateTime), 1.0 / 240.0), 0.25)
         lastExposureUpdateTime = now
         updateExposure(deltaTime: exposureDeltaTime)
+
+        let requestedRenderMode = preferredRenderMode(isMoving: isMoving)
+        let wantsMetalFX = requestedRenderMode == .metalfx && upscaler?.supportsMetalFX == true
+        let renderScale = wantsMetalFX ? metalFXRenderScale : 1.0
+        let renderW = max(1, Int((Float(outputWidth) * renderScale).rounded(.toNearestOrAwayFromZero)))
+        let renderH = max(1, Int((Float(outputHeight) * renderScale).rounded(.toNearestOrAwayFromZero)))
 
         // ── Ensure textures / temporal state ──
         let texturesChanged = pathTracer.ensureTextures(renderWidth: renderW, renderHeight: renderH,
@@ -289,7 +292,7 @@ class Renderer {
                             outputWidth: outputWidth,
                             outputHeight: outputHeight)
 
-        let effectiveRenderMode = resolvedRenderMode(isMoving: isMoving)
+        let effectiveRenderMode = resolvedRenderMode(requestedMode: requestedRenderMode)
         activeRenderMode = effectiveRenderMode
 
         // ── Accumulation logic ──
@@ -308,11 +311,18 @@ class Renderer {
             }
             accumulationCount += 1
         case .metalfx:
-            if selectedRenderMode == .auto && startedMoving {
+            if isMoving {
                 accumulationCount = 0
-                upscaler?.reset()
+                if startedMoving {
+                    upscaler?.reset()
+                }
+            } else {
+                if stoppedMoving {
+                    accumulationCount = 0
+                    upscaler?.reset()
+                }
+                accumulationCount += 1
             }
-            accumulationCount += 1
         case .auto:
             accumulationCount = 0
         }
@@ -391,13 +401,23 @@ class Renderer {
                let colorTexture = pathTracer.colorTexture,
                let depthTexture = pathTracer.depthTexture,
                let motionTexture = pathTracer.motionTexture {
+                let metalFXInput: MTLTexture
+                if isMoving {
+                    metalFXInput = colorTexture
+                } else {
+                    pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
+                                                 uniforms: &uniforms)
+                    pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
+                    metalFXInput = pathTracer.accumulatedTexture ?? colorTexture
+                }
+
                 upscaler.encode(commandBuffer: commandBuffer,
-                                colorTexture: colorTexture,
+                                colorTexture: metalFXInput,
                                 depthTexture: depthTexture,
                                 motionTexture: motionTexture,
                                 jitterX: jitter.x,
                                 jitterY: jitter.y)
-                hdrSource = upscaler.outputTexture ?? colorTexture
+                hdrSource = upscaler.outputTexture ?? metalFXInput
             } else {
                 hdrSource = pathTracer.colorTexture
             }
@@ -558,14 +578,15 @@ class Renderer {
         return min(max(targetExposure, minAutoExposure), maxAutoExposure)
     }
 
-    private func resolvedRenderMode(isMoving: Bool) -> RenderMode {
-        let requestedMode: RenderMode
+    private func preferredRenderMode(isMoving: Bool) -> RenderMode {
         if selectedRenderMode == .auto {
-            requestedMode = isMoving ? .metalfx : .svgf
-        } else {
-            requestedMode = selectedRenderMode
+            return isMoving ? .metalfx : .svgf
         }
 
+        return selectedRenderMode
+    }
+
+    private func resolvedRenderMode(requestedMode: RenderMode) -> RenderMode {
         if requestedMode == .metalfx && upscaler?.isAvailable != true {
             return .raw
         }

@@ -70,7 +70,7 @@ class PathTracer {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     private let bloomSettings = BloomSettings()
-    private let svgfStepWidths: [UInt32] = [1, 2, 4, 8]
+    private let svgfStepWidths: [UInt32] = [1, 2]
 
     private var pathTracePipeline: MTLComputePipelineState!
     private var accumulatePipeline: MTLComputePipelineState!
@@ -357,10 +357,10 @@ class PathTracer {
             renderHeight: uniforms.renderHeight,
             stepWidth: 1,
             passIndex: 0,
-            colorPhiScale: 6.0,
-            normalPhi: 48.0,
-            depthPhi: 64.0,
-            albedoPhi: 8.0
+            colorPhiScale: 1.5,
+            normalPhi: 128.0,
+            depthPhi: 256.0,
+            albedoPhi: 24.0
         )
 
         var sourceTexture: MTLTexture = temporalTex
@@ -395,9 +395,7 @@ class PathTracer {
 
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "SVGF History Update"
-            if let svgfFilteredTexture {
-                blit.copy(from: svgfFilteredTexture, to: historyTex)
-            }
+            blit.copy(from: temporalTex, to: historyTex)
             blit.copy(from: momentsTex, to: historyMomentsTex)
             blit.copy(from: historyLengthScratchTex, to: historyLengthTex)
             blit.copy(from: depthTex, to: historyDepthTex)

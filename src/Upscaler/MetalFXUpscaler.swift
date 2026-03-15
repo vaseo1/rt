@@ -12,6 +12,7 @@ import MetalFX
 
 class MetalFXUpscaler {
     let device: MTLDevice
+    let supportsMetalFX: Bool
     private var temporalScaler: MTLFXTemporalScaler?
     private var pendingReset = true
 
@@ -24,6 +25,7 @@ class MetalFXUpscaler {
 
     init(device: MTLDevice) {
         self.device = device
+        self.supportsMetalFX = MTLFXTemporalScalerDescriptor.supportsDevice(device)
     }
 
     func configure(inputWidth: Int, inputHeight: Int,
@@ -31,7 +33,13 @@ class MetalFXUpscaler {
                    colorFormat: MTLPixelFormat = .rgba32Float,
                    depthFormat: MTLPixelFormat = .r32Float,
                    motionFormat: MTLPixelFormat = .rg16Float,
-                   outputFormat: MTLPixelFormat = .rgba32Float) {
+                   outputFormat: MTLPixelFormat = .rgba16Float) {
+        guard supportsMetalFX else {
+            temporalScaler = nil
+            outputTexture = nil
+            return
+        }
+
         guard inputWidth != self.inputWidth || inputHeight != self.inputHeight
                 || outputWidth != self.outputWidth || outputHeight != self.outputHeight else {
             return
