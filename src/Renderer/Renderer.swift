@@ -338,9 +338,11 @@ class Renderer {
         if let hdrSource {
             pathTracer.encodeExposureMeasurement(commandBuffer: commandBuffer,
                                                 sourceTexture: hdrSource)
+            let tonemapSource = pathTracer.encodeBloom(commandBuffer: commandBuffer,
+                                                       sourceTexture: hdrSource) ?? hdrSource
             pathTracer.encodeTonemap(commandBuffer: commandBuffer,
                                      uniforms: &uniforms,
-                                     sourceTexture: hdrSource)
+                                     sourceTexture: tonemapSource)
         }
         previousCameraMoving = isMoving
 

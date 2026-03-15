@@ -1,6 +1,30 @@
 import Metal
 import simd
 
+private struct BloomSettings {
+    var threshold: Float = 1.1
+    var softKnee: Float = 0.75
+    var intensity: Float = 0.085
+    var blurScale: Float = 1.35
+}
+
+private struct BloomUniforms {
+    var sourceWidth: UInt32
+    var sourceHeight: UInt32
+    var outputWidth: UInt32
+    var outputHeight: UInt32
+    var bloomWidth: UInt32
+    var bloomHeight: UInt32
+    var threshold: Float
+    var softKnee: Float
+    var intensity: Float
+    var blurScale: Float
+    var directionX: Float
+    var directionY: Float
+    var padding0: Float
+    var padding1: Float
+}
+
 // ─── GPU Uniforms (must match Common.metal layout exactly) ───────────────────
 
 struct Uniforms {
@@ -43,10 +67,14 @@ struct Uniforms {
 class PathTracer {
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
+    private let bloomSettings = BloomSettings()
 
     private var pathTracePipeline: MTLComputePipelineState!
     private var accumulatePipeline: MTLComputePipelineState!
     private var measureExposurePipeline: MTLComputePipelineState!
+    private var extractBloomPipeline: MTLComputePipelineState!
+    private var blurBloomPipeline: MTLComputePipelineState!
+    private var compositeBloomPipeline: MTLComputePipelineState!
     private var tonemapPipeline: MTLComputePipelineState!
     private let exposureReadbackBuffer: MTLBuffer
 
@@ -56,6 +84,9 @@ class PathTracer {
     private(set) var motionTexture: MTLTexture?
     private(set) var historyTexture: MTLTexture?
     private(set) var accumulatedTexture: MTLTexture?
+    private(set) var bloomTexture: MTLTexture?
+    private(set) var bloomScratchTexture: MTLTexture?
+    private(set) var bloomCompositeTexture: MTLTexture?
     private(set) var tonemappedTexture: MTLTexture?
 
     private var currentRenderWidth: Int = 0
@@ -94,6 +125,9 @@ class PathTracer {
         pathTracePipeline = makePipeline("pathTraceKernel")
         accumulatePipeline = makePipeline("accumulateKernel")
         measureExposurePipeline = makePipeline("measureExposureKernel")
+        extractBloomPipeline = makePipeline("extractBloomKernel")
+        blurBloomPipeline = makePipeline("blurBloomKernel")
+        compositeBloomPipeline = makePipeline("compositeBloomKernel")
         tonemapPipeline = makePipeline("tonemapKernel")
     }
 
@@ -123,6 +157,11 @@ class PathTracer {
         motionTexture       = makeTexture(renderWidth, renderHeight, format: .rg16Float)
         historyTexture      = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
         accumulatedTexture  = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
+        let bloomWidth = max(1, (outputWidth + 1) / 2)
+        let bloomHeight = max(1, (outputHeight + 1) / 2)
+        bloomTexture = makeTexture(bloomWidth, bloomHeight, format: .rgba16Float)
+        bloomScratchTexture = makeTexture(bloomWidth, bloomHeight, format: .rgba16Float)
+        bloomCompositeTexture = makeTexture(outputWidth, outputHeight, format: .rgba32Float)
         let tonemapDesc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm, width: outputWidth, height: outputHeight, mipmapped: false)
         tonemapDesc.usage = [.shaderRead, .shaderWrite, .renderTarget]
@@ -235,6 +274,94 @@ class PathTracer {
     func readMeasuredAverageLuminance() -> Float {
         let value = exposureReadbackBuffer.contents().assumingMemoryBound(to: Float.self).pointee
         return max(value, 1e-4)
+    }
+
+    func encodeBloom(commandBuffer: MTLCommandBuffer,
+                     sourceTexture: MTLTexture) -> MTLTexture? {
+        guard bloomSettings.intensity > 0,
+              let bloomTexture,
+              let bloomScratchTexture,
+              let bloomCompositeTexture else {
+            return nil
+        }
+
+        var bloomUniforms = BloomUniforms(
+            sourceWidth: UInt32(sourceTexture.width),
+            sourceHeight: UInt32(sourceTexture.height),
+            outputWidth: UInt32(bloomCompositeTexture.width),
+            outputHeight: UInt32(bloomCompositeTexture.height),
+            bloomWidth: UInt32(bloomTexture.width),
+            bloomHeight: UInt32(bloomTexture.height),
+            threshold: bloomSettings.threshold,
+            softKnee: bloomSettings.softKnee,
+            intensity: bloomSettings.intensity,
+            blurScale: bloomSettings.blurScale,
+            directionX: 0,
+            directionY: 0,
+            padding0: 0,
+            padding1: 0
+        )
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bloom Extract"
+            encoder.setComputePipelineState(extractBloomPipeline)
+            encoder.setBytes(&bloomUniforms, length: MemoryLayout<BloomUniforms>.size, index: 0)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(bloomTexture, index: 1)
+
+            let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+            let gridSize = MTLSize(width: bloomTexture.width, height: bloomTexture.height, depth: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        bloomUniforms.directionX = 1
+        bloomUniforms.directionY = 0
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bloom Blur Horizontal"
+            encoder.setComputePipelineState(blurBloomPipeline)
+            encoder.setBytes(&bloomUniforms, length: MemoryLayout<BloomUniforms>.size, index: 0)
+            encoder.setTexture(bloomTexture, index: 0)
+            encoder.setTexture(bloomScratchTexture, index: 1)
+
+            let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+            let gridSize = MTLSize(width: bloomScratchTexture.width, height: bloomScratchTexture.height, depth: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        bloomUniforms.directionX = 0
+        bloomUniforms.directionY = 1
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bloom Blur Vertical"
+            encoder.setComputePipelineState(blurBloomPipeline)
+            encoder.setBytes(&bloomUniforms, length: MemoryLayout<BloomUniforms>.size, index: 0)
+            encoder.setTexture(bloomScratchTexture, index: 0)
+            encoder.setTexture(bloomTexture, index: 1)
+
+            let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+            let gridSize = MTLSize(width: bloomTexture.width, height: bloomTexture.height, depth: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bloom Composite"
+            encoder.setComputePipelineState(compositeBloomPipeline)
+            encoder.setBytes(&bloomUniforms, length: MemoryLayout<BloomUniforms>.size, index: 0)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(bloomTexture, index: 1)
+            encoder.setTexture(bloomCompositeTexture, index: 2)
+
+            let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+            let gridSize = MTLSize(width: bloomCompositeTexture.width, height: bloomCompositeTexture.height, depth: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        return bloomCompositeTexture
     }
 
     func encodeTonemap(commandBuffer: MTLCommandBuffer,

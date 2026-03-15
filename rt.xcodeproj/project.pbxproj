@@ -10,6 +10,7 @@
 		1C293F259E01D2255E0CFA77 /* AccelStructure.swift in Sources */ = {isa = PBXBuildFile; fileRef = EE2A7DAFCFDAE3640846AC3D /* AccelStructure.swift */; };
 		2D591D814F7E76ECFF681E82 /* Common.metal in Sources */ = {isa = PBXBuildFile; fileRef = 66EF89AC761B051B352CEF25 /* Common.metal */; };
 		32A5E65E2B58264B9E7F7C19 /* ScreenshotCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 728DC2B94DAC3133F2B84CB6 /* ScreenshotCapture.swift */; };
+		487B5B24548BCE34B3E00556 /* Bloom.metal in Sources */ = {isa = PBXBuildFile; fileRef = EE4C2D668FD6B837B7E59230 /* Bloom.metal */; };
 		62BD2D9D52A00AF3B9D13A5A /* Renderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77883A96BA83A34AF97E11C4 /* Renderer.swift */; };
 		8321218655436168B81A45AB /* PathTrace.metal in Sources */ = {isa = PBXBuildFile; fileRef = FF2E9F6E08FBB140B9C3AC54 /* PathTrace.metal */; };
 		AAC181CE4EE0F991E87E85C0 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76315360BFB3A857281CA99B /* main.swift */; };
@@ -37,6 +38,7 @@
 		BFBAA98B6CC6224948AE13C3 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		EBF55833F79D9E9255184B0F /* Camera.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Camera.swift; sourceTree = "<group>"; };
 		EE2A7DAFCFDAE3640846AC3D /* AccelStructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccelStructure.swift; sourceTree = "<group>"; };
+		EE4C2D668FD6B837B7E59230 /* Bloom.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = Bloom.metal; sourceTree = "<group>"; };
 		FF2E9F6E08FBB140B9C3AC54 /* PathTrace.metal */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.metal; path = PathTrace.metal; sourceTree = "<group>"; };
 		FFE99989E1E08FBD1F155D84 /* BSPLoader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BSPLoader.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -68,6 +70,7 @@
 			isa = PBXGroup;
 			children = (
 				04DEF86BD1A13493DB6B1BE5 /* Accumulate.metal */,
+				EE4C2D668FD6B837B7E59230 /* Bloom.metal */,
 				66EF89AC761B051B352CEF25 /* Common.metal */,
 				FF2E9F6E08FBB140B9C3AC54 /* PathTrace.metal */,
 			);
@@ -181,6 +184,7 @@
 				F957D4610F1EA1DED48CC905 /* Accumulate.metal in Sources */,
 				F5DDEF1173D72CEE55B58942 /* AppDelegate.swift in Sources */,
 				F13CFB1C9F04EFF4E1DBD9C0 /* BSPLoader.swift in Sources */,
+				487B5B24548BCE34B3E00556 /* Bloom.metal in Sources */,
 				C08DFD9E01073BE9845D0529 /* Camera.swift in Sources */,
 				2D591D814F7E76ECFF681E82 /* Common.metal in Sources */,
 				FA3730B75F9BE163AF304FFE /* GameView.swift in Sources */,

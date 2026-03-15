@@ -47,7 +47,7 @@ src/
     GameView.swift            CAMetalLayer + CVDisplayLink + input
   Renderer/
     Renderer.swift            orchestrator: scene load, adaptive res, accumulation
-    PathTracer.swift          3 compute pipelines, texture management, GPU encode
+    PathTracer.swift          path trace, bloom, tonemap, texture management, GPU encode
     AccelStructure.swift      MTLAccelerationStructure build + compact
   Scene/
     BSPLoader.swift           Quake BSP v29 parser + PAKLoader
@@ -59,16 +59,18 @@ shaders/
   Common.metal                shared structs (Vertex, Material, Uniforms), RNG, sampling
   PathTrace.metal             path trace kernel (texturing, NEE, DOF, emissives)
   Accumulate.metal            temporal accumulation + ACES tonemap kernels
+  Bloom.metal                 HDR bright-pass, blur, and bloom composite kernels
 ```
 
 ## GPU Pipeline
 
 ```
-pathTraceKernel → accumulateKernel → tonemapKernel → blit to drawable
+pathTraceKernel → accumulateKernel or MetalFX → bloom → tonemapKernel → blit to drawable
 ```
 
 - **Path trace**: 1 spp/frame, Lambertian BRDF, cosine-weighted hemisphere, Russian roulette after bounce 3. Outputs HDR color + depth + motion vectors.
 - **Accumulate**: running average `mix(history, current, 1/N)`. Resets on camera move.
+- **Bloom**: thresholds bright HDR highlights, blurs at half resolution, composites before tonemap.
 - **Tonemap**: ACES filmic + sRGB gamma, firefly clamp at luminance 50.
 
 ## Asset Pipeline
