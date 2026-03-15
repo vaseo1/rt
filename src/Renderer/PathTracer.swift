@@ -25,9 +25,10 @@ struct Uniforms {
     var focusDistance: Float
     var lightCount: UInt32
     var debugFlags: UInt32
-    var _pad0: UInt32 = 0
-    var _pad1: UInt32 = 0
-    var _pad2: UInt32 = 0
+    var environmentTint: (Float, Float, Float)
+    var environmentIntensity: Float
+    var environmentSunDirection: (Float, Float, Float)
+    var environmentSunIntensity: Float
 }
 
 // ─── Path Tracer Pipeline ────────────────────────────────────────────────────

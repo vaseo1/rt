@@ -76,10 +76,48 @@ struct Uniforms {
     float    focusDistance;
     uint     lightCount;
     uint     debugFlags;
-    uint     _pad0;
-    uint     _pad1;
-    uint     _pad2;
+    packed_float3 environmentTint;
+    float    environmentIntensity;
+    packed_float3 environmentSunDirection;
+    float    environmentSunIntensity;
 };
+
+inline float3 sampleProceduralEnvironment(float3 direction, constant Uniforms& uniforms) {
+    float3 dir = normalize(direction);
+    float3 tint = max(float3(uniforms.environmentTint), float3(0.0f));
+    float intensity = max(uniforms.environmentIntensity, 0.0f);
+
+    float3 sunDir = float3(uniforms.environmentSunDirection);
+    if (dot(sunDir, sunDir) <= 1e-6f) {
+        sunDir = float3(-0.35f, 0.82f, 0.45f);
+    }
+    sunDir = normalize(sunDir);
+
+    float sunIntensity = max(uniforms.environmentSunIntensity, 0.0f);
+    float up = saturate(dir.y * 0.5f + 0.5f);
+    float zenithBlend = pow(up, 0.35f);
+    float skyBlend = smoothstep(-0.35f, 0.04f, dir.y);
+    float horizonGlow = pow(1.0f - saturate(abs(dir.y)), 5.0f);
+
+    float3 groundColor = float3(0.02f, 0.025f, 0.03f);
+    float3 horizonColor = float3(0.92f, 0.70f, 0.44f);
+    float3 zenithColor = float3(0.11f, 0.24f, 0.55f);
+
+    float3 skyColor = mix(horizonColor, zenithColor, zenithBlend);
+    skyColor += horizonGlow * float3(0.14f, 0.10f, 0.05f);
+
+    float sunAmount = saturate(dot(dir, sunDir));
+    float sunGlow = pow(sunAmount, 48.0f);
+    float sunDisk = pow(sunAmount, 2048.0f);
+    float3 sunColor = mix(float3(1.0f, 0.76f, 0.46f),
+                          float3(1.0f, 0.94f, 0.84f),
+                          saturate(sunDir.y));
+
+    skyColor += sunGlow * sunColor * sunIntensity * 0.35f;
+    skyColor += sunDisk * sunColor * sunIntensity * 8.0f;
+
+    return mix(groundColor, skyColor, skyBlend) * tint * intensity;
+}
 
 // ─── Random number generation (PCG) ─────────────────────────────────────────
 

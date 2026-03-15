@@ -25,6 +25,7 @@ class Renderer {
     private let startupLookAtPosition: SIMD3<Float>?
     private let lookAtWaterOnLoad: Bool
     private let highlightWater: Bool
+    private var environmentSettings = EnvironmentSettings.default
 
     // Resolution
     private var outputWidth: Int = 2560
@@ -115,9 +116,22 @@ class Renderer {
         }
 
         guard let data = bspData else { return }
+        environmentSettings = data.environment
 
         // Upload to GPU
         scene.loadFromBSP(data)
+
+        let envTint = environmentSettings.tint
+        let sunDir = environmentSettings.sunDirection
+        print(String(format: "[Renderer] Environment tint=(%.2f, %.2f, %.2f) intensity=%.2f sunDir=(%.2f, %.2f, %.2f) sunIntensity=%.2f",
+                 envTint.x,
+                 envTint.y,
+                 envTint.z,
+                 environmentSettings.intensity,
+                 sunDir.x,
+                 sunDir.y,
+                 sunDir.z,
+                 environmentSettings.sunIntensity))
 
         let waterFramingPosition = data.preferredLiquidSurface.map { liquidSurface in
             let suggestedCameraPosition = liquidSurface.position + liquidSurface.normal * 24.0
@@ -256,7 +270,15 @@ class Renderer {
             aperture: camera.aperture,
             focusDistance: camera.focusDistance,
             lightCount: UInt32(scene.lightCount),
-            debugFlags: highlightWater ? 1 : 0
+            debugFlags: highlightWater ? 1 : 0,
+            environmentTint: (environmentSettings.tint.x,
+                              environmentSettings.tint.y,
+                              environmentSettings.tint.z),
+            environmentIntensity: environmentSettings.intensity,
+            environmentSunDirection: (environmentSettings.sunDirection.x,
+                                      environmentSettings.sunDirection.y,
+                                      environmentSettings.sunDirection.z),
+            environmentSunIntensity: environmentSettings.sunIntensity
         )
 
         // ── Encode ──
@@ -576,7 +598,8 @@ class Renderer {
             entityString: "",
             spawnPosition: SIMD3<Float>(0, 80, 180),
             spawnAngle: 0,
-            preferredLiquidSurface: nil
+            preferredLiquidSurface: nil,
+            environment: .default
         )
     }
 }

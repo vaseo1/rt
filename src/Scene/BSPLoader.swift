@@ -120,6 +120,20 @@ struct SurfaceAnchor {
     var normal: SIMD3<Float>
 }
 
+struct EnvironmentSettings {
+    var tint: SIMD3<Float>
+    var intensity: Float
+    var sunDirection: SIMD3<Float>
+    var sunIntensity: Float
+
+    static let `default` = EnvironmentSettings(
+        tint: SIMD3<Float>(repeating: 1.0),
+        intensity: 1.0,
+        sunDirection: simd_normalize(SIMD3<Float>(-0.35, 0.82, 0.45)),
+        sunIntensity: 1.0
+    )
+}
+
 private struct MaterialClassification {
     let surfaceType: UInt32
     let roughness: Float
@@ -136,6 +150,7 @@ struct BSPData {
     var spawnPosition: SIMD3<Float>
     var spawnAngle: Float
     var preferredLiquidSurface: SurfaceAnchor?
+    var environment: EnvironmentSettings
 }
 
 // MARK: - BSP Loader
@@ -302,6 +317,7 @@ class BSPLoader {
         let preferredLiquidSurface = findPreferredLiquidSurface(vertices: parsedVertices,
                                     indices: indices,
                                     materials: materials)
+        let environment = inferEnvironmentSettings(from: materials)
 
         print("[BSP] Loaded: \(parsedVertices.count) vertices, \(indices.count / 3) triangles, \(materials.count) materials")
 
@@ -312,7 +328,8 @@ class BSPLoader {
             entityString: entityStr,
             spawnPosition: spawnPos,
             spawnAngle: spawnAngle,
-            preferredLiquidSurface: preferredLiquidSurface
+            preferredLiquidSurface: preferredLiquidSurface,
+            environment: environment
         )
     }
 
@@ -508,6 +525,65 @@ class BSPLoader {
         if n.hasPrefix("flame")     { return SIMD3<Float>(1.0, 0.6, 0.1) }
         // Default warm white for light textures
         return SIMD3<Float>(1.0, 0.9, 0.7)
+    }
+
+    private func inferEnvironmentSettings(from materials: [ParsedMaterial]) -> EnvironmentSettings {
+        let skyMaterials = materials.filter { $0.name.lowercased().hasPrefix("sky") }
+        guard !skyMaterials.isEmpty else {
+            return .default
+        }
+
+        var averageSky = SIMD3<Float>(repeating: 0.0)
+        for material in skyMaterials {
+            averageSky += averageColor(for: material)
+        }
+        averageSky /= Float(skyMaterials.count)
+
+        let white = SIMD3<Float>(repeating: 1.0)
+        let maxChannel = max(max(averageSky.x, averageSky.y), averageSky.z)
+        let normalizedSky = maxChannel > 0.0001 ? averageSky / maxChannel : white
+        let tint = white + (normalizedSky - white) * 0.45
+
+        let skyLuminance = max(dot(averageSky, SIMD3<Float>(0.2126, 0.7152, 0.0722)), 0.0)
+        let intensity = min(max(0.85 + skyLuminance * 0.75, 0.75), 1.75)
+        let sunIntensity = min(max(1.1 + skyLuminance * 1.5, 1.0), 2.5)
+
+        return EnvironmentSettings(
+            tint: tint,
+            intensity: intensity,
+            sunDirection: EnvironmentSettings.default.sunDirection,
+            sunIntensity: sunIntensity
+        )
+    }
+
+    private func averageColor(for material: ParsedMaterial) -> SIMD3<Float> {
+        guard let pixels = material.texturePixels, !pixels.isEmpty else {
+            return material.albedo
+        }
+
+        var sum = SIMD3<Float>(repeating: 0.0)
+        var sampleCount: Float = 0.0
+        var index = 0
+
+        while index + 3 < pixels.count {
+            let alpha = pixels[index + 3]
+            if alpha > 0 {
+                let color = SIMD3<Float>(
+                    pow(Float(pixels[index + 0]) / 255.0, 2.2),
+                    pow(Float(pixels[index + 1]) / 255.0, 2.2),
+                    pow(Float(pixels[index + 2]) / 255.0, 2.2)
+                )
+                sum += color
+                sampleCount += 1.0
+            }
+            index += 4
+        }
+
+        guard sampleCount > 0 else {
+            return material.albedo
+        }
+
+        return sum / sampleCount
     }
 
     private func classifyMaterial(named name: String, isEmissive: Bool) -> MaterialClassification {

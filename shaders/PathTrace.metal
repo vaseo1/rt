@@ -127,11 +127,7 @@ kernel void pathTraceKernel(
             auto intersection = inter.intersect(r, accelStructure);
 
             if (intersection.type == intersection_type::none) {
-                // Sky gradient
-                float t = 0.5f * (r.direction.y + 1.0f);
-                float3 skyColor = mix(float3(0.8f, 0.85f, 0.9f),
-                                      float3(0.3f, 0.5f, 0.8f), t);
-                radiance += throughput * skyColor * 0.8f;
+                radiance += throughput * sampleProceduralEnvironment(r.direction, uniforms);
                 break;
             }
 
