@@ -38,6 +38,16 @@ enum ScreenshotCapture {
         let h = texture.height
         let bytesPerRow = w * 4
 
+        if texture.storageMode != .private {
+            var pixels = [UInt8](repeating: 0, count: bytesPerRow * h)
+            texture.getBytes(&pixels,
+                             bytesPerRow: bytesPerRow,
+                             from: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                             size: MTLSize(width: w, height: h, depth: 1)),
+                             mipmapLevel: 0)
+            return pixels
+        }
+
         // Create a shared-mode staging texture for CPU readback
         let desc = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: texture.pixelFormat, width: w, height: h, mipmapped: false)

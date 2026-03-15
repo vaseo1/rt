@@ -54,7 +54,8 @@ kernel void tonemapKernel(
     uint2 srcCoord = uint2(float2(tid) * scale);
     srcCoord = min(srcCoord, uint2(uniforms.renderWidth - 1, uniforms.renderHeight - 1));
 
-    float3 hdr = hdrInput.read(srcCoord).rgb;
+    constexpr float exposure = 4.0f;
+    float3 hdr = hdrInput.read(srcCoord).rgb * exposure;
 
     // Clamp fireflies
     float lum = dot(hdr, float3(0.2126f, 0.7152f, 0.0722f));

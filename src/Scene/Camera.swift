@@ -10,6 +10,8 @@ class Camera {
     var nearZ: Float = 0.1
     var farZ: Float = 10000.0
     var aspectRatio: Float = 16.0 / 9.0
+    var aperture: Float = 0.0           // 0 = pinhole (no DOF), try 2.0 for subtle effect
+    var focusDistance: Float = 500.0    // distance to focus plane
 
     var moveSpeed: Float = 200.0
     var mouseSensitivity: Float = 0.002

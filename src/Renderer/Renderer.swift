@@ -36,6 +36,9 @@ class Renderer {
     var verifyConfig = VerifyConfig()
     var pendingScreenshot = false
     private var verifyCompleted = false
+    private(set) var captureInProgress = false
+    private var submittedFrames: UInt32 = 0
+    private var completedFrames: UInt32 = 0
 
     init(device: MTLDevice, view: GameView) {
         self.device = device
@@ -59,12 +62,22 @@ class Renderer {
         let assetsDir = findAssetsDirectory()
         var bspData: BSPData?
 
+        // Load Quake palette for texture decoding
+        let pakPath = assetsDir.appendingPathComponent("pak0.pak")
+        var palette: [UInt8]? = nil
+        if FileManager.default.fileExists(atPath: pakPath.path) {
+            if let paletteData = try? PAKLoader().extractFile(from: pakPath, name: "gfx/palette.lmp") {
+                palette = [UInt8](paletteData)
+                print("[Renderer] Loaded Quake palette (\(paletteData.count) bytes)")
+            }
+        }
+
         // 1. Try loading .bsp directly
         let bspPath = assetsDir.appendingPathComponent("e1m1.bsp")
         if FileManager.default.fileExists(atPath: bspPath.path) {
             print("[Renderer] Loading BSP from: \(bspPath.path)")
             do {
-                bspData = try BSPLoader().load(from: bspPath)
+                bspData = try BSPLoader().load(from: bspPath, palette: palette)
             } catch {
                 print("[Renderer] Failed to load BSP: \(error)")
             }
@@ -72,12 +85,11 @@ class Renderer {
 
         // 2. Try extracting from pak0.pak
         if bspData == nil {
-            let pakPath = assetsDir.appendingPathComponent("pak0.pak")
             if FileManager.default.fileExists(atPath: pakPath.path) {
                 print("[Renderer] Loading from PAK: \(pakPath.path)")
                 do {
                     let pakData = try PAKLoader().extractBSP(from: pakPath, mapName: "maps/e1m1.bsp")
-                    bspData = try BSPLoader().load(data: pakData)
+                    bspData = try BSPLoader().load(data: pakData, palette: palette)
                 } catch {
                     print("[Renderer] Failed to load PAK: \(error)")
                 }
@@ -143,14 +155,17 @@ class Renderer {
             cameraPosition: (pos.x, pos.y, pos.z),
             frameIndex: frameIndex,
             accumulationCount: accumulationCount,
-            samplesPerPixel: 1, // always 1 spp, accumulate over frames
+            samplesPerPixel: 1,
             maxBounces: 8,
             jitterX: jitter.x,
             jitterY: jitter.y,
             renderWidth: UInt32(renderW),
             renderHeight: UInt32(renderH),
             outputWidth: UInt32(outputWidth),
-            outputHeight: UInt32(outputHeight)
+            outputHeight: UInt32(outputHeight),
+            aperture: camera.aperture,
+            focusDistance: camera.focusDistance,
+            lightCount: UInt32(scene.lightCount)
         )
 
         // ── Ensure textures ──
@@ -164,6 +179,12 @@ class Renderer {
 
         // ── Encode ──
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+        submittedFrames += 1
+        let submittedFrame = submittedFrames
+        let submitTime = CACurrentMediaTime()
+        if verifyConfig.enabled && submittedFrame <= 8 {
+            print("[Renderer] Submit frame #\(submittedFrame) accumulation=\(accumulationCount) render=\(renderW)x\(renderH) output=\(outputWidth)x\(outputHeight) moving=\(camera.isMoving)")
+        }
 
         pathTracer.encode(commandBuffer: commandBuffer,
                           uniforms: &uniforms,
@@ -196,15 +217,37 @@ class Renderer {
         let needsScreenshot = pendingScreenshot
         if needsVerify { verifyCompleted = true }
         if needsScreenshot { pendingScreenshot = false }
+        if needsVerify || needsScreenshot { captureInProgress = true }
 
-        commandBuffer.addCompletedHandler { [weak self] _ in
+        commandBuffer.addCompletedHandler { [weak self] buffer in
             // Screenshot / verify capture (GPU work is done, off main thread)
-            if let self = self, let tex = self.pathTracer.tonemappedTexture {
+            if let self = self {
+                self.completedFrames += 1
+                let elapsedMs = (CACurrentMediaTime() - submitTime) * 1000.0
+                if self.verifyConfig.enabled && submittedFrame <= 8 {
+                    let errorText = buffer.error.map { String(describing: $0) } ?? "none"
+                    print(String(format: "[Renderer] Complete frame #%u status=%@ elapsed=%.1fms error=%@ accumulation=%u",
+                                 submittedFrame,
+                                 self.debugDescription(for: buffer.status),
+                                 elapsedMs,
+                                 errorText,
+                                 self.accumulationCount))
+                }
+
+                if let tex = self.pathTracer.tonemappedTexture {
                 if needsVerify {
                     self.performVerifyCapture(texture: tex)
+                        defer {
+                            if !needsVerify {
+                                DispatchQueue.main.async {
+                                    self.captureInProgress = false
+                                }
+                            }
+                        }
                 } else if needsScreenshot {
                     self.performInteractiveScreenshot(texture: tex)
                 }
+            }
             }
             onComplete?()
         }
@@ -245,6 +288,18 @@ class Renderer {
         let saved = ScreenshotCapture.capture(texture: texture, commandQueue: commandQueue, to: desktopURL)
         let metrics = ScreenshotCapture.computeMetrics(texture: texture, commandQueue: commandQueue)
         metrics.printReport(screenshotPath: saved ? desktopURL.path : nil)
+    }
+
+    private func debugDescription(for status: MTLCommandBufferStatus) -> String {
+        switch status {
+        case .notEnqueued: return "notEnqueued"
+        case .enqueued: return "enqueued"
+        case .committed: return "committed"
+        case .scheduled: return "scheduled"
+        case .completed: return "completed"
+        case .error: return "error"
+        @unknown default: return "unknown"
+        }
     }
 
     // MARK: - Helpers
@@ -295,10 +350,14 @@ class Renderer {
         var materials: [ParsedMaterial] = []
 
         // Materials
-        materials.append(ParsedMaterial(name: "white", albedo: SIMD3<Float>(0.73, 0.73, 0.73), emissiveStrength: 0))
-        materials.append(ParsedMaterial(name: "red", albedo: SIMD3<Float>(0.65, 0.05, 0.05), emissiveStrength: 0))
-        materials.append(ParsedMaterial(name: "green", albedo: SIMD3<Float>(0.12, 0.45, 0.15), emissiveStrength: 0))
-        materials.append(ParsedMaterial(name: "light", albedo: SIMD3<Float>(1.0, 0.9, 0.7), emissiveStrength: 15.0))
+        materials.append(ParsedMaterial(name: "white", albedo: SIMD3<Float>(0.73, 0.73, 0.73), emissiveStrength: 0,
+                                        emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+        materials.append(ParsedMaterial(name: "red", albedo: SIMD3<Float>(0.65, 0.05, 0.05), emissiveStrength: 0,
+                                        emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+        materials.append(ParsedMaterial(name: "green", albedo: SIMD3<Float>(0.12, 0.45, 0.15), emissiveStrength: 0,
+                                        emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
+        materials.append(ParsedMaterial(name: "light", albedo: SIMD3<Float>(1.0, 0.9, 0.7), emissiveStrength: 15.0,
+                                        emissiveColor: SIMD3<Float>(1.0, 0.9, 0.7), textureWidth: 0, textureHeight: 0, texturePixels: nil))
 
         let s: Float = 200 // half-size of room
 

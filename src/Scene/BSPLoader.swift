@@ -80,6 +80,7 @@ private struct BSPMipTex {
     let width: UInt32
     let height: UInt32
     let offsets: (UInt32, UInt32, UInt32, UInt32) // mip offsets
+    let pixelData: Data?    // palette indices for mip level 0
 }
 
 // MARK: - Parsed Output
@@ -95,6 +96,10 @@ struct ParsedMaterial {
     var name: String
     var albedo: SIMD3<Float>
     var emissiveStrength: Float
+    var emissiveColor: SIMD3<Float>
+    var textureWidth: Int
+    var textureHeight: Int
+    var texturePixels: [UInt8]?
 }
 
 struct BSPData {
@@ -111,14 +116,17 @@ struct BSPData {
 class BSPLoader {
     private var data: Data = Data()
     private var lumps: [BSPLump] = []
+    private var palette: [UInt8]?
 
-    func load(from url: URL) throws -> BSPData {
+    func load(from url: URL, palette: [UInt8]? = nil) throws -> BSPData {
         data = try Data(contentsOf: url)
+        self.palette = palette
         return try parse()
     }
 
-    func load(data: Data) throws -> BSPData {
+    func load(data: Data, palette: [UInt8]? = nil) throws -> BSPData {
         self.data = data
+        self.palette = palette
         return try parse()
     }
 
@@ -159,15 +167,36 @@ class BSPLoader {
                              name.hasPrefix("*teleport") ||
                              name.hasPrefix("flame") ||
                              name.contains("light")
+
+            // Convert paletted texture to RGBA using Quake palette
+            var texturePixels: [UInt8]? = nil
+            if let pixelData = tex.pixelData, let pal = palette, pal.count >= 768 {
+                let count = Int(tex.width) * Int(tex.height)
+                var rgba = [UInt8](repeating: 0, count: count * 4)
+                for i in 0..<count {
+                    let idx = Int(pixelData[pixelData.startIndex + i])
+                    rgba[i * 4 + 0] = pal[idx * 3 + 0]
+                    rgba[i * 4 + 1] = pal[idx * 3 + 1]
+                    rgba[i * 4 + 2] = pal[idx * 3 + 2]
+                    rgba[i * 4 + 3] = (idx == 255) ? 0 : 255
+                }
+                texturePixels = rgba
+            }
+
             materials.append(ParsedMaterial(
                 name: tex.name,
                 albedo: colorForTexture(name: name),
-                emissiveStrength: isEmissive ? 25.0 : 0.0
+                emissiveStrength: isEmissive ? 25.0 : 0.0,
+                emissiveColor: isEmissive ? emissiveColorForTexture(name: name) : .zero,
+                textureWidth: Int(tex.width),
+                textureHeight: Int(tex.height),
+                texturePixels: texturePixels
             ))
         }
 
         if materials.isEmpty {
-            materials.append(ParsedMaterial(name: "default", albedo: SIMD3<Float>(0.7, 0.7, 0.7), emissiveStrength: 0))
+            materials.append(ParsedMaterial(name: "default", albedo: SIMD3<Float>(0.7, 0.7, 0.7), emissiveStrength: 0,
+                                            emissiveColor: .zero, textureWidth: 0, textureHeight: 0, texturePixels: nil))
         }
 
         // Triangulate faces
@@ -207,13 +236,17 @@ class BSPLoader {
             // Fan triangulation: vertex 0 is hub
             let baseIndex = UInt32(parsedVertices.count)
 
+            let texIdx = min(Int(matIndex), mipTextures.count - 1)
+            let texWidth = Float(max(1, mipTextures[texIdx].width))
+            let texHeight = Float(max(1, mipTextures[texIdx].height))
+
             for v in faceVerts {
                 let u = dot(v, uAxis) + texInfo.uOffset
                 let vCoord = dot(v, vAxis) + texInfo.vOffset
                 parsedVertices.append(ParsedVertex(
                     position: v,
                     normal: faceNormal,
-                    uv: SIMD2<Float>(u / 64.0, vCoord / 64.0), // normalize roughly
+                    uv: SIMD2<Float>(u / texWidth, vCoord / texHeight),
                     materialIndex: matIndex
                 ))
             }
@@ -224,6 +257,9 @@ class BSPLoader {
                 indices.append(baseIndex + UInt32(i + 1))
             }
         }
+
+        // Smooth normals at shared vertices
+        smoothNormals(vertices: &parsedVertices)
 
         // Parse entities for spawn point
         let entityStr = readEntityString()
@@ -363,17 +399,29 @@ class BSPLoader {
 
             let width: UInt32 = readValue(at: texBase + 16)
             let height: UInt32 = readValue(at: texBase + 20)
+            let offset0: UInt32 = readValue(at: texBase + 24)
+
+            // Extract mip level 0 pixel data if embedded
+            var pixelData: Data? = nil
+            if offset0 > 0 && width > 0 && height > 0 {
+                let pixelStart = texBase + Int(offset0)
+                let pixelCount = Int(width) * Int(height)
+                if pixelStart >= 0 && pixelStart + pixelCount <= data.count {
+                    pixelData = data[pixelStart..<(pixelStart + pixelCount)]
+                }
+            }
 
             textures.append(BSPMipTex(
                 name: name,
                 width: width,
                 height: height,
                 offsets: (
-                    readValue(at: texBase + 24),
+                    offset0,
                     readValue(at: texBase + 28),
                     readValue(at: texBase + 32),
                     readValue(at: texBase + 36)
-                )
+                ),
+                pixelData: pixelData
             ))
         }
         return textures
@@ -412,6 +460,52 @@ class BSPLoader {
         if n.contains("door")       { return SIMD3<Float>(0.4, 0.3, 0.2) }
         // Default stone/concrete
         return SIMD3<Float>(0.45, 0.42, 0.38)
+    }
+
+    private func emissiveColorForTexture(name: String) -> SIMD3<Float> {
+        let n = name.lowercased()
+        if n.hasPrefix("*lava")     { return SIMD3<Float>(1.0, 0.4, 0.05) }
+        if n.hasPrefix("*teleport") { return SIMD3<Float>(0.6, 0.1, 1.0) }
+        if n.hasPrefix("flame")     { return SIMD3<Float>(1.0, 0.6, 0.1) }
+        // Default warm white for light textures
+        return SIMD3<Float>(1.0, 0.9, 0.7)
+    }
+
+    private func smoothNormals(vertices: inout [ParsedVertex]) {
+        let cosThreshold: Float = cos(60.0 * .pi / 180.0)
+        let scale: Float = 100.0
+
+        // Build spatial hash: quantized position → [vertex indices]
+        var posMap: [SIMD3<Int32>: [Int]] = [:]
+        for i in 0..<vertices.count {
+            let p = vertices[i].position
+            let key = SIMD3<Int32>(Int32(round(p.x * scale)),
+                                   Int32(round(p.y * scale)),
+                                   Int32(round(p.z * scale)))
+            posMap[key, default: []].append(i)
+        }
+
+        // Compute smoothed normals
+        var newNormals = vertices.map { $0.normal }
+        for (_, group) in posMap {
+            guard group.count > 1 else { continue }
+            for idx in group {
+                let origNormal = vertices[idx].normal
+                var smooth = SIMD3<Float>(0, 0, 0)
+                for otherIdx in group {
+                    if dot(origNormal, vertices[otherIdx].normal) >= cosThreshold {
+                        smooth += vertices[otherIdx].normal
+                    }
+                }
+                let len = length(smooth)
+                if len > 0.001 {
+                    newNormals[idx] = smooth / len
+                }
+            }
+        }
+        for i in 0..<vertices.count {
+            vertices[i].normal = newNormals[i]
+        }
     }
 
     private func parseSpawnPoint(from entityStr: String) -> (SIMD3<Float>, Float) {
@@ -516,6 +610,39 @@ class PAKLoader {
         }
 
         throw BSPError.mapNotFound("Map '\(mapName)' not found in PAK file")
+    }
+
+    func extractFile(from pakURL: URL, name: String) throws -> Data {
+        let pakData = try Data(contentsOf: pakURL)
+        guard pakData.count > 12 else {
+            throw BSPError.invalidFile("PAK file too small")
+        }
+        let magic = String(data: pakData[0..<4], encoding: .ascii)
+        guard magic == "PACK" else {
+            throw BSPError.invalidFile("Not a PAK file")
+        }
+        let dirOffset: Int32 = readUnaligned(from: pakData, at: 4)
+        let dirLength: Int32 = readUnaligned(from: pakData, at: 8)
+        let entryCount = Int(dirLength) / 64
+
+        for i in 0..<entryCount {
+            let entryBase = Int(dirOffset) + i * 64
+            let nameData = pakData[entryBase..<(entryBase + 56)]
+            let entryName = String(data: nameData, encoding: .ascii)?
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\0")) ?? ""
+            let fileOffset: Int32 = readUnaligned(from: pakData, at: entryBase + 56)
+            let fileSize: Int32 = readUnaligned(from: pakData, at: entryBase + 60)
+
+            if entryName.lowercased() == name.lowercased() {
+                let start = Int(fileOffset)
+                let end = start + Int(fileSize)
+                guard end <= pakData.count else {
+                    throw BSPError.invalidFile("File extends beyond PAK")
+                }
+                return Data(pakData[start..<end])
+            }
+        }
+        throw BSPError.mapNotFound("'\(name)' not found in PAK")
     }
 
     func listEntries(from pakURL: URL) throws -> [PAKEntry] {

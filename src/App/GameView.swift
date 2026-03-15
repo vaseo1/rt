@@ -14,6 +14,8 @@ class GameView: NSView, CALayerDelegate {
 
     // Limit in-flight frames so nextDrawable() never blocks the main thread
     private let frameSemaphore = DispatchSemaphore(value: 2)
+    private var debugFrameNumber: UInt32 = 0
+    private var loggedSemaphoreSaturation = false
 
     // Key codes
     private let keyW: UInt16 = 13
@@ -111,9 +113,22 @@ class GameView: NSView, CALayerDelegate {
 
     private func renderFrame() {
         guard let renderer = renderer else { return }
+        if renderer.captureInProgress { return }
 
         // Skip frame if GPU is saturated — keeps main thread free for input events
-        guard frameSemaphore.wait(timeout: .now()) == .success else { return }
+        guard frameSemaphore.wait(timeout: .now()) == .success else {
+            if renderer.verifyConfig.enabled && !loggedSemaphoreSaturation {
+                print("[GameView] Frame skipped: waiting for in-flight GPU work")
+                loggedSemaphoreSaturation = true
+            }
+            return
+        }
+        loggedSemaphoreSaturation = false
+
+        debugFrameNumber += 1
+        if renderer.verifyConfig.enabled && debugFrameNumber <= 8 {
+            print("[GameView] renderFrame #\(debugFrameNumber)")
+        }
 
         let dt: Float = 1.0 / 60.0
 
@@ -139,6 +154,9 @@ class GameView: NSView, CALayerDelegate {
 
         // Render
         guard let drawable = metalLayer.nextDrawable() else {
+            if renderer.verifyConfig.enabled {
+                print("[GameView] nextDrawable() returned nil")
+            }
             frameSemaphore.signal()
             return
         }

@@ -6,7 +6,7 @@ import simd
 struct Uniforms {
     var inverseViewProjection: float4x4
     var previousViewProjection: float4x4
-    var cameraPosition: (Float, Float, Float) // packed_float3
+    var cameraPosition: (Float, Float, Float)
     var frameIndex: UInt32
     var accumulationCount: UInt32
     var samplesPerPixel: UInt32
@@ -17,6 +17,9 @@ struct Uniforms {
     var renderHeight: UInt32
     var outputWidth: UInt32
     var outputHeight: UInt32
+    var aperture: Float
+    var focusDistance: Float
+    var lightCount: UInt32
 }
 
 // ─── Path Tracer Pipeline ────────────────────────────────────────────────────
@@ -102,8 +105,11 @@ class PathTracer {
         motionTexture       = makeTexture(renderWidth, renderHeight, format: .rg16Float)
         historyTexture      = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
         accumulatedTexture  = makeTexture(renderWidth, renderHeight, format: .rgba32Float)
-        tonemappedTexture   = makeTexture(outputWidth, outputHeight, format: .bgra8Unorm,
-                                          usage: [.shaderRead, .shaderWrite, .renderTarget])
+        let tonemapDesc = MTLTextureDescriptor.texture2DDescriptor(
+            pixelFormat: .bgra8Unorm, width: outputWidth, height: outputHeight, mipmapped: false)
+        tonemapDesc.usage = [.shaderRead, .shaderWrite, .renderTarget]
+        tonemapDesc.storageMode = .shared
+        tonemappedTexture = device.makeTexture(descriptor: tonemapDesc)
 
         return true
     }
@@ -121,7 +127,9 @@ class PathTracer {
               let tonemapTex = tonemappedTexture,
               let vertexBuf = scene.vertexBuffer,
               let indexBuf = scene.indexBuffer,
-              let materialBuf = scene.materialBuffer else {
+              let materialBuf = scene.materialBuffer,
+              let texDataBuf = scene.textureDataBuffer,
+              let lightBuf = scene.lightBuffer else {
             return
         }
 
@@ -137,9 +145,12 @@ class PathTracer {
             encoder.setComputePipelineState(pathTracePipeline)
             encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 0)
             encoder.setAccelerationStructure(accelStructure, bufferIndex: 1)
+            encoder.useResource(accelStructure, usage: .read)
             encoder.setBuffer(vertexBuf, offset: 0, index: 2)
             encoder.setBuffer(indexBuf, offset: 0, index: 3)
             encoder.setBuffer(materialBuf, offset: 0, index: 4)
+            encoder.setBuffer(texDataBuf, offset: 0, index: 5)
+            encoder.setBuffer(lightBuf, offset: 0, index: 6)
             encoder.setTexture(colorTex, index: 0)
             encoder.setTexture(depthTex, index: 1)
             encoder.setTexture(motionTex, index: 2)

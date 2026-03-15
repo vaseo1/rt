@@ -17,7 +17,28 @@ struct Vertex {
 
 struct Material {
     packed_float3 albedo;
-    float         emissiveStrength; // 0 = non-emissive, >0 = light source
+    float         emissiveStrength;
+    packed_float3 emissiveColor;
+    uint          textureOffset;    // into texture data buffer (0xFFFFFFFF = none)
+    uint          textureWidth;
+    uint          textureHeight;
+    uint          _pad0;
+    uint          _pad1;
+};
+
+// ─── Light (emissive triangle for NEE) ───────────────────────────────────────
+
+struct Light {
+    packed_float3 v0;
+    float         area;
+    packed_float3 edge1;
+    float         _pad0;
+    packed_float3 edge2;
+    float         _pad1;
+    packed_float3 emission;
+    float         _pad2;
+    packed_float3 normal;
+    float         _pad3;
 };
 
 // ─── Per-frame uniforms ──────────────────────────────────────────────────────
@@ -36,6 +57,9 @@ struct Uniforms {
     uint     renderHeight;
     uint     outputWidth;
     uint     outputHeight;
+    float    aperture;
+    float    focusDistance;
+    uint     lightCount;
 };
 
 // ─── Random number generation (PCG) ─────────────────────────────────────────
