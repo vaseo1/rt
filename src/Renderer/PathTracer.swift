@@ -8,8 +8,11 @@ struct Uniforms {
     var previousViewProjection: float4x4
     var cameraPosition: (Float, Float, Float)
     var frameIndex: UInt32
+    var cameraRight: (Float, Float, Float)
     var accumulationCount: UInt32
+    var cameraUp: (Float, Float, Float)
     var samplesPerPixel: UInt32
+    var cameraForward: (Float, Float, Float)
     var maxBounces: UInt32
     var jitterX: Float
     var jitterY: Float
@@ -20,6 +23,9 @@ struct Uniforms {
     var aperture: Float
     var focusDistance: Float
     var lightCount: UInt32
+    var _pad0: UInt32 = 0
+    var _pad1: UInt32 = 0
+    var _pad2: UInt32 = 0
 }
 
 // ─── Path Tracer Pipeline ────────────────────────────────────────────────────

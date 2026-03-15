@@ -70,26 +70,21 @@ kernel void pathTraceKernel(
         nearPoint /= nearPoint.w;
         farPoint  /= farPoint.w;
 
-        float3 rayOrigin    = nearPoint.xyz;
-        float3 rayDirection = normalize(farPoint.xyz - nearPoint.xyz);
+        float3 cameraPosition = float3(uniforms.cameraPosition);
+        float3 cameraRight = normalize(float3(uniforms.cameraRight));
+        float3 cameraUp = normalize(float3(uniforms.cameraUp));
+        float3 cameraForward = normalize(float3(uniforms.cameraForward));
+
+        float3 rayOrigin    = cameraPosition;
+        float3 rayDirection = normalize(farPoint.xyz - cameraPosition);
 
         // ── Depth of Field (thin lens model) ──
         if (uniforms.aperture > 0.0f) {
-            float3 focusPoint = rayOrigin + rayDirection * uniforms.focusDistance;
+            float focusT = uniforms.focusDistance / max(1e-4f, dot(rayDirection, cameraForward));
+            float3 focusPoint = cameraPosition + rayDirection * focusT;
+            float2 lensSample = concentricSampleDisk(rng.next2()) * uniforms.aperture;
 
-            // Build lens basis perpendicular to ray
-            float3 w = rayDirection;
-            float3 up = abs(w.y) < 0.999f ? float3(0, 1, 0) : float3(1, 0, 0);
-            float3 u = normalize(cross(up, w));
-            float3 v = cross(w, u);
-
-            // Random point on lens disk
-            float2 lens = rng.next2();
-            float lensAngle = 2.0f * M_PI_F * lens.x;
-            float lensRadius = uniforms.aperture * sqrt(lens.y);
-
-            float3 offset = (u * cos(lensAngle) + v * sin(lensAngle)) * lensRadius;
-            rayOrigin += offset;
+            rayOrigin = cameraPosition + cameraRight * lensSample.x + cameraUp * lensSample.y;
             rayDirection = normalize(focusPoint - rayOrigin);
         }
 

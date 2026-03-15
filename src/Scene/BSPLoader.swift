@@ -259,7 +259,7 @@ class BSPLoader {
         }
 
         // Smooth normals at shared vertices
-        smoothNormals(vertices: &parsedVertices)
+        smoothNormals(vertices: &parsedVertices, indices: indices)
 
         // Parse entities for spawn point
         let entityStr = readEntityString()
@@ -471,11 +471,25 @@ class BSPLoader {
         return SIMD3<Float>(1.0, 0.9, 0.7)
     }
 
-    private func smoothNormals(vertices: inout [ParsedVertex]) {
+    private func smoothNormals(vertices: inout [ParsedVertex], indices: [UInt32]) {
         let cosThreshold: Float = cos(60.0 * .pi / 180.0)
         let scale: Float = 100.0
 
-        // Build spatial hash: quantized position → [vertex indices]
+        var cornerWeights = [Float](repeating: 0, count: vertices.count)
+        for tri in stride(from: 0, to: indices.count, by: 3) {
+            let i0 = Int(indices[tri])
+            let i1 = Int(indices[tri + 1])
+            let i2 = Int(indices[tri + 2])
+
+            let p0 = vertices[i0].position
+            let p1 = vertices[i1].position
+            let p2 = vertices[i2].position
+
+            cornerWeights[i0] += cornerAngle(at: p0, prev: p2, next: p1)
+            cornerWeights[i1] += cornerAngle(at: p1, prev: p0, next: p2)
+            cornerWeights[i2] += cornerAngle(at: p2, prev: p1, next: p0)
+        }
+
         var posMap: [SIMD3<Int32>: [Int]] = [:]
         for i in 0..<vertices.count {
             let p = vertices[i].position
@@ -485,7 +499,6 @@ class BSPLoader {
             posMap[key, default: []].append(i)
         }
 
-        // Compute smoothed normals
         var newNormals = vertices.map { $0.normal }
         for (_, group) in posMap {
             guard group.count > 1 else { continue }
@@ -494,7 +507,8 @@ class BSPLoader {
                 var smooth = SIMD3<Float>(0, 0, 0)
                 for otherIdx in group {
                     if dot(origNormal, vertices[otherIdx].normal) >= cosThreshold {
-                        smooth += vertices[otherIdx].normal
+                        let weight = max(cornerWeights[otherIdx], 0.0)
+                        smooth += vertices[otherIdx].normal * max(weight, 0.0001)
                     }
                 }
                 let len = length(smooth)
@@ -506,6 +520,20 @@ class BSPLoader {
         for i in 0..<vertices.count {
             vertices[i].normal = newNormals[i]
         }
+    }
+
+    private func cornerAngle(at current: SIMD3<Float>, prev: SIMD3<Float>, next: SIMD3<Float>) -> Float {
+        let edge0 = prev - current
+        let edge1 = next - current
+
+        let len0 = length(edge0)
+        let len1 = length(edge1)
+        guard len0 > 0.0001, len1 > 0.0001 else { return 0 }
+
+        let dir0 = edge0 / len0
+        let dir1 = edge1 / len1
+        let cosine = max(-1.0, min(1.0, dot(dir0, dir1)))
+        return acos(cosine)
     }
 
     private func parseSpawnPoint(from entityStr: String) -> (SIMD3<Float>, Float) {

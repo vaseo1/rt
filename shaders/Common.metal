@@ -48,8 +48,11 @@ struct Uniforms {
     float4x4 previousViewProjection;
     packed_float3 cameraPosition;
     uint     frameIndex;          // total frames rendered
+    packed_float3 cameraRight;
     uint     accumulationCount;   // how many frames accumulated (resets on move)
+    packed_float3 cameraUp;
     uint     samplesPerPixel;     // spp this frame
+    packed_float3 cameraForward;
     uint     maxBounces;
     float    jitterX;
     float    jitterY;
@@ -60,6 +63,9 @@ struct Uniforms {
     float    aperture;
     float    focusDistance;
     uint     lightCount;
+    uint     _pad0;
+    uint     _pad1;
+    uint     _pad2;
 };
 
 // ─── Random number generation (PCG) ─────────────────────────────────────────
@@ -103,6 +109,27 @@ inline float3 cosineWeightedHemisphere(float2 u, float3 normal) {
     float3 bitangent = cross(normal, tangent);
 
     return normalize(tangent * x + bitangent * y + normal * z);
+}
+
+inline float2 concentricSampleDisk(float2 u) {
+    float2 offset = 2.0f * u - 1.0f;
+
+    if (offset.x == 0.0f && offset.y == 0.0f) {
+        return float2(0.0f);
+    }
+
+    float radius;
+    float theta;
+
+    if (abs(offset.x) > abs(offset.y)) {
+        radius = offset.x;
+        theta = (M_PI_F / 4.0f) * (offset.y / offset.x);
+    } else {
+        radius = offset.y;
+        theta = (M_PI_F / 2.0f) - (M_PI_F / 4.0f) * (offset.x / offset.y);
+    }
+
+    return radius * float2(cos(theta), sin(theta));
 }
 
 // ─── Tonemapping ─────────────────────────────────────────────────────────────

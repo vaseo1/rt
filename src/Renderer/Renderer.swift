@@ -149,13 +149,19 @@ class Renderer {
         // ── Build uniforms ──
         let jitter = camera.jitterOffset
         let pos = camera.position
+        let right = camera.rightVector
+        let up = camera.upVector
+        let forward = camera.forwardVector
         var uniforms = Uniforms(
             inverseViewProjection: camera.inverseViewProjectionMatrix,
             previousViewProjection: camera.previousViewProjectionMatrix,
             cameraPosition: (pos.x, pos.y, pos.z),
             frameIndex: frameIndex,
+            cameraRight: (right.x, right.y, right.z),
             accumulationCount: accumulationCount,
+            cameraUp: (up.x, up.y, up.z),
             samplesPerPixel: 1,
+            cameraForward: (forward.x, forward.y, forward.z),
             maxBounces: 8,
             jitterX: jitter.x,
             jitterY: jitter.y,

@@ -41,7 +41,7 @@ src/
     MetalFXUpscaler.swift     MTLFXTemporalScaler wrapper
 shaders/
   Common.metal                shared structs (Vertex, Material, Uniforms), RNG, sampling
-  PathTrace.metal             path trace kernel (bounces, Russian roulette, emissives)
+  PathTrace.metal             path trace kernel (texturing, NEE, DOF, emissives)
   Accumulate.metal            temporal accumulation + ACES tonemap kernels
 ```
 
@@ -72,8 +72,10 @@ Full resolution, 8 bounces, 1 spp per frame — always. Samples accumulate via r
 ## Key Implementation Details
 
 - **Coord system**: Quake Z-up → engine Y-up via `SIMD3(x, z, -y)`
-- **No texture sampling**: BSP texture names → approximate albedo colors
-- **Emissives**: textures prefixed `light`, `*lava`, `*teleport`, `flame` → emissiveStrength 5.0
+- **Texture pipeline**: BSP miptex level 0 pixels are palette-decoded to RGBA and bilinearly sampled in the path tracer
+- **Emissives**: textures prefixed `light`, `*lava`, `*teleport`, `flame` become colored area lights with emissiveStrength 25.0
+- **Smooth normals**: spatial hash welding with angle-weighted averaging and a 60° hard-edge threshold
+- **Depth of field**: thin-lens ray generation with aperture disk sampling and focus-distance plane intersection
 - **Struct layout**: Swift `Uniforms` uses `(Float, Float, Float)` tuples to match Metal `packed_float3`
 - **Binary reads**: `memcpy`-based to avoid alignment traps on arbitrary BSP offsets
 - **Retina**: drawable size = window size × `backingScaleFactor`
