@@ -69,7 +69,7 @@ Fallback: Cornell box test scene if no assets found.
 
 | State | Render scale | Max bounces |
 |-------|-------------|-------------|
-| Moving (key/mouse) | 10% | 1 |
+| Moving (key/mouse) | 100% | 1 |
 | Stationary | 100% | 8 |
 
 Instant snap between modes. Frame semaphore (2 in-flight) prevents GPU saturation from blocking the main thread, ensuring input is always responsive.

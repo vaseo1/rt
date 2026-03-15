@@ -148,8 +148,7 @@ class GameView: NSView, CALayerDelegate {
 
         // Update title with stats
         let spp = renderer.accumulationCount
-        let res = renderer.currentResolutionScale
-        window?.title = String(format: "RT Path Tracer — %d spp — %.0f%% res", spp, res * 100)
+        window?.title = String(format: "RT Path Tracer — %d spp", spp)
     }
 
     deinit {

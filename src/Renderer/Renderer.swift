@@ -7,11 +7,9 @@ import simd
 // ─── Renderer ────────────────────────────────────────────────────────────────
 //
 // Orchestrates the full render pipeline:
-//   1. Adaptive resolution based on camera motion
-//   2. Path trace at internal resolution
-//   3. Accumulate when stationary
-//   4. MetalFX upscale when moving at reduced res
-//   5. Tonemap + present to drawable
+//   1. Path trace at full resolution (1 bounce moving, 8 stationary)
+//   2. Accumulate when stationary
+//   3. Tonemap + present to drawable
 
 class Renderer {
     let device: MTLDevice
@@ -26,7 +24,6 @@ class Renderer {
     // Resolution
     private var outputWidth: Int = 2560
     private var outputHeight: Int = 1440
-    private(set) var currentResolutionScale: Float = 1.0
 
     // Accumulation
     private(set) var accumulationCount: UInt32 = 0
@@ -122,13 +119,9 @@ class Renderer {
             return
         }
 
-        // ── Adaptive resolution: 2 modes ──
-        // Dynamic (moving): 10% res, 1 bounce
-        // Static (stopped):  100% res, 8 bounces
-        currentResolutionScale = camera.isMoving ? 0.1 : 1.0
-
-        let renderW = max(1, Int(Float(outputWidth) * currentResolutionScale))
-        let renderH = max(1, Int(Float(outputHeight) * currentResolutionScale))
+        // ── Render resolution ──
+        let renderW = outputWidth
+        let renderH = outputHeight
 
         camera.aspectRatio = Float(outputWidth) / Float(outputHeight)
 
