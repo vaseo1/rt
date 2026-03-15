@@ -7,8 +7,8 @@ import simd
 // ─── Renderer ────────────────────────────────────────────────────────────────
 //
 // Orchestrates the full render pipeline:
-//   1. Path trace at full resolution (1 bounce moving, 8 stationary)
-//   2. Accumulate when stationary
+//   1. Path trace at full resolution, 8 bounces
+//   2. Accumulate over frames (reset on camera move)
 //   3. Tonemap + present to drawable
 
 class Renderer {
@@ -144,7 +144,7 @@ class Renderer {
             frameIndex: frameIndex,
             accumulationCount: accumulationCount,
             samplesPerPixel: 1, // always 1 spp, accumulate over frames
-            maxBounces: camera.isMoving ? 1 : 8,
+            maxBounces: 8,
             jitterX: jitter.x,
             jitterY: jitter.y,
             renderWidth: UInt32(renderW),

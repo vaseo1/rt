@@ -65,14 +65,9 @@ PAKLoader → BSP bytes → BSPLoader → BSPData → SceneGeometry → AccelStr
 
 Fallback: Cornell box test scene if no assets found.
 
-## Adaptive Resolution
+## Accumulation
 
-| State | Render scale | Max bounces |
-|-------|-------------|-------------|
-| Moving (key/mouse) | 100% | 1 |
-| Stationary | 100% | 8 |
-
-Instant snap between modes. Frame semaphore (2 in-flight) prevents GPU saturation from blocking the main thread, ensuring input is always responsive.
+Full resolution, 8 bounces, 1 spp per frame — always. Samples accumulate via running average `mix(history, current, 1/N)`. Camera movement resets accumulation. Frame semaphore (2 in-flight) prevents GPU saturation from blocking the main thread, ensuring input is always responsive.
 
 ## Key Implementation Details
 
