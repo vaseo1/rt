@@ -27,12 +27,10 @@ class Renderer {
     private var outputWidth: Int = 2560
     private var outputHeight: Int = 1440
     private(set) var currentResolutionScale: Float = 1.0
-    private var targetResolutionScale: Float = 1.0
 
     // Accumulation
     private(set) var accumulationCount: UInt32 = 0
     private var frameIndex: UInt32 = 0
-    private var timeSinceLastMove: Float = 1.0
 
     // State
     private var sceneLoaded = false
@@ -117,16 +115,17 @@ class Renderer {
 
     // MARK: - Render
 
-    func render(to drawable: CAMetalDrawable) {
+    func render(to drawable: CAMetalDrawable, onComplete: (() -> Void)? = nil) {
         guard sceneLoaded,
               let accelStructure = accelBuilder.accelerationStructure else {
+            onComplete?()
             return
         }
 
-        let dt: Float = 1.0 / 60.0
-
-        // ── Adaptive resolution ──
-        updateResolution(dt: dt)
+        // ── Adaptive resolution: 2 modes ──
+        // Dynamic (moving): 10% res, 1 bounce
+        // Static (stopped):  100% res, 8 bounces
+        currentResolutionScale = camera.isMoving ? 0.1 : 1.0
 
         let renderW = max(1, Int(Float(outputWidth) * currentResolutionScale))
         let renderH = max(1, Int(Float(outputHeight) * currentResolutionScale))
@@ -136,10 +135,8 @@ class Renderer {
         // ── Accumulation logic ──
         if camera.isMoving {
             accumulationCount = 1
-            timeSinceLastMove = 0
             camera.resetAccumulation()
         } else {
-            timeSinceLastMove += dt
             accumulationCount += 1
         }
         camera.advanceJitter()
@@ -153,8 +150,8 @@ class Renderer {
             cameraPosition: (pos.x, pos.y, pos.z),
             frameIndex: frameIndex,
             accumulationCount: accumulationCount,
-            samplesPerPixel: camera.isMoving ? 1 : 1, // always 1 spp, accumulate over frames
-            maxBounces: camera.isMoving ? 4 : 8,
+            samplesPerPixel: 1, // always 1 spp, accumulate over frames
+            maxBounces: camera.isMoving ? 1 : 8,
             jitterX: jitter.x,
             jitterY: jitter.y,
             renderWidth: UInt32(renderW),
@@ -200,45 +197,28 @@ class Renderer {
         }
 
         commandBuffer.present(drawable)
+
+        // Capture screenshot/verify state before the completed handler
+        let needsVerify = verifyConfig.enabled && !verifyCompleted && accumulationCount >= verifyConfig.targetFrames
+        let needsScreenshot = pendingScreenshot
+        if needsVerify { verifyCompleted = true }
+        if needsScreenshot { pendingScreenshot = false }
+
+        commandBuffer.addCompletedHandler { [weak self] _ in
+            // Screenshot / verify capture (GPU work is done, off main thread)
+            if let self = self, let tex = self.pathTracer.tonemappedTexture {
+                if needsVerify {
+                    self.performVerifyCapture(texture: tex)
+                } else if needsScreenshot {
+                    self.performInteractiveScreenshot(texture: tex)
+                }
+            }
+            onComplete?()
+        }
+
         commandBuffer.commit()
 
-        // Screenshot / verify capture (after GPU work is committed)
-        // ScreenshotCapture does its own blit to a shared staging texture,
-        // so we just need to wait for the rendering command buffer to finish first.
-        if let tex = pathTracer.tonemappedTexture {
-            if verifyConfig.enabled && !verifyCompleted && accumulationCount >= verifyConfig.targetFrames {
-                verifyCompleted = true
-                commandBuffer.waitUntilCompleted()
-                performVerifyCapture(texture: tex)
-            } else if pendingScreenshot {
-                pendingScreenshot = false
-                commandBuffer.waitUntilCompleted()
-                performInteractiveScreenshot(texture: tex)
-            }
-        }
-
         frameIndex += 1
-    }
-
-    // MARK: - Adaptive Resolution
-
-    private func updateResolution(dt: Float) {
-        if camera.isMoving {
-            targetResolutionScale = 0.5
-        } else if timeSinceLastMove < 0.5 {
-            targetResolutionScale = 0.75
-        } else {
-            targetResolutionScale = 1.0
-        }
-
-        // Smooth transitions
-        let speed: Float = 5.0
-        currentResolutionScale += (targetResolutionScale - currentResolutionScale) * min(speed * dt, 1.0)
-
-        // Snap when close
-        if abs(currentResolutionScale - targetResolutionScale) < 0.01 {
-            currentResolutionScale = targetResolutionScale
-        }
     }
 
     func resize(width: Int, height: Int) {

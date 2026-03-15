@@ -12,6 +12,9 @@ class GameView: NSView, CALayerDelegate {
     private var mouseDeltaX: Float = 0
     private var mouseDeltaY: Float = 0
 
+    // Limit in-flight frames so nextDrawable() never blocks the main thread
+    private let frameSemaphore = DispatchSemaphore(value: 2)
+
     // Key codes
     private let keyW: UInt16 = 13
     private let keyA: UInt16 = 0
@@ -109,6 +112,9 @@ class GameView: NSView, CALayerDelegate {
     private func renderFrame() {
         guard let renderer = renderer else { return }
 
+        // Skip frame if GPU is saturated — keeps main thread free for input events
+        guard frameSemaphore.wait(timeout: .now()) == .success else { return }
+
         let dt: Float = 1.0 / 60.0
 
         // Update camera from input
@@ -132,8 +138,13 @@ class GameView: NSView, CALayerDelegate {
         mouseDeltaY = 0
 
         // Render
-        guard let drawable = metalLayer.nextDrawable() else { return }
-        renderer.render(to: drawable)
+        guard let drawable = metalLayer.nextDrawable() else {
+            frameSemaphore.signal()
+            return
+        }
+        renderer.render(to: drawable) { [weak self] in
+            self?.frameSemaphore.signal()
+        }
 
         // Update title with stats
         let spp = renderer.accumulationCount

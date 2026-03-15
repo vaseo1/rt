@@ -69,11 +69,10 @@ Fallback: Cornell box test scene if no assets found.
 
 | State | Render scale | Max bounces |
 |-------|-------------|-------------|
-| Moving | 50% | 4 |
-| Settling (<0.5s) | 75% | 8 |
+| Moving (key/mouse) | 10% | 1 |
 | Stationary | 100% | 8 |
 
-Smooth lerp at rate 5.0/s. Textures quantized to 8px steps to avoid per-frame reallocation.
+Instant snap between modes. Frame semaphore (2 in-flight) prevents GPU saturation from blocking the main thread, ensuring input is always responsive.
 
 ## Key Implementation Details
 
