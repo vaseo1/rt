@@ -14,6 +14,7 @@ class Camera {
     var focusDistance: Float = 500.0    // distance to focus plane
 
     var moveSpeed: Float = 200.0
+    var sprintMultiplier: Float = 3.0
     var mouseSensitivity: Float = 0.002
 
     private(set) var isMoving: Bool = false
@@ -25,7 +26,7 @@ class Camera {
     private(set) var previousViewProjectionMatrix: float4x4 = .identity
 
     func update(forward: Bool, back: Bool, left: Bool, right: Bool,
-                up: Bool, down: Bool,
+                up: Bool, sprint: Bool,
                 mouseDeltaX: Float, mouseDeltaY: Float, dt: Float) {
 
         // Store previous VP before updating
@@ -38,7 +39,8 @@ class Camera {
         pitch = max(-.pi / 2.0 + 0.01, min(.pi / 2.0 - 0.01, pitch))
 
         // Movement
-        let hasKeyInput = forward || back || left || right || up || down
+        let hasHorizontalInput = forward || back || left || right
+        let hasKeyInput = hasHorizontalInput || up
         isMoving = hasKeyInput || hasMouseInput
 
         if hasKeyInput {
@@ -51,11 +53,11 @@ class Camera {
             if right   { move += rgt }
             if left    { move -= rgt }
             if up      { move.y += 1 }
-            if down    { move.y -= 1 }
 
             let len = length(move)
             if len > 0.001 {
-                move = normalize(move) * moveSpeed * dt
+                let speed = moveSpeed * (sprint && hasHorizontalInput ? sprintMultiplier : 1.0)
+                move = normalize(move) * speed * dt
                 position += move
             }
         }

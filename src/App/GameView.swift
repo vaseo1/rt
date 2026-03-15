@@ -11,6 +11,7 @@ class GameView: NSView, CALayerDelegate {
     private var mouseCaptured = false
     private var mouseDeltaX: Float = 0
     private var mouseDeltaY: Float = 0
+    private var shiftPressed = false
 
     // Limit in-flight frames so nextDrawable() never blocks the main thread
     private let frameSemaphore = DispatchSemaphore(value: 2)
@@ -24,7 +25,8 @@ class GameView: NSView, CALayerDelegate {
     private let keyD: UInt16 = 2
     private let keyEscape: UInt16 = 53
     private let keySpace: UInt16 = 49
-    private let keyShift: UInt16 = 56
+    private let keyLeftShift: UInt16 = 56
+    private let keyRightShift: UInt16 = 60
     private let keyF12: UInt16 = 111
 
     init(frame: NSRect, device: MTLDevice) {
@@ -138,12 +140,12 @@ class GameView: NSView, CALayerDelegate {
         let left    = keysPressed.contains(keyA)
         let right   = keysPressed.contains(keyD)
         let up      = keysPressed.contains(keySpace)
-        let down    = keysPressed.contains(keyShift)
+        let sprint  = shiftPressed
 
         renderer.camera.update(
             forward: forward, back: back,
             left: left, right: right,
-            up: up, down: down,
+            up: up, sprint: sprint,
             mouseDeltaX: mouseDeltaX,
             mouseDeltaY: mouseDeltaY,
             dt: dt
@@ -192,6 +194,12 @@ class GameView: NSView, CALayerDelegate {
 
     override func keyUp(with event: NSEvent) {
         keysPressed.remove(event.keyCode)
+    }
+
+    override func flagsChanged(with event: NSEvent) {
+        if event.keyCode == keyLeftShift || event.keyCode == keyRightShift {
+            shiftPressed = event.modifierFlags.contains(.shift)
+        }
     }
 
     // MARK: - Mouse Input

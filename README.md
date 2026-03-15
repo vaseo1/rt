@@ -32,8 +32,9 @@ open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --ar
 | Key | Action |
 |-----|--------|
 | WASD | Move |
+| Shift + WASD | Move faster |
 | Mouse | Look |
-| Space / Shift | Up / Down |
+| Space | Up |
 | Escape | Release cursor / Quit |
 
 ## Architecture
