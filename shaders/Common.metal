@@ -44,6 +44,7 @@ struct Light {
 // ─── Per-frame uniforms ──────────────────────────────────────────────────────
 
 struct Uniforms {
+    float4x4 currentViewProjection;
     float4x4 inverseViewProjection;
     float4x4 previousViewProjection;
     packed_float3 cameraPosition;

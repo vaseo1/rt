@@ -52,6 +52,8 @@ kernel void pathTraceKernel(
 
     float3 totalRadiance = float3(0.0f);
     float  totalDepth    = 0.0f;
+    float2 totalMotion   = float2(0.0f);
+    uint   motionSamples = 0;
 
     for (uint s = 0; s < uniforms.samplesPerPixel; s++) {
         RNG rng(tid, uniforms.frameIndex, s);
@@ -91,8 +93,10 @@ kernel void pathTraceKernel(
         // ── Path trace with multiple bounces ──
 
         float3 radiance   = float3(0.0f);
-        float3 throughput  = float3(1.0f);
-        float  primaryDepth = 1e10f;
+    float3 throughput = float3(1.0f);
+    float  primaryDepth = 1.0f;
+    float2 primaryMotion = float2(0.0f);
+    bool   hasPrimaryHit = false;
 
         ray r;
         r.origin       = rayOrigin;
@@ -119,10 +123,6 @@ kernel void pathTraceKernel(
 
             float hitDistance = intersection.distance;
 
-            if (bounce == 0) {
-                primaryDepth = hitDistance;
-            }
-
             // Get triangle data
             uint primitiveIndex = intersection.primitive_id;
             float2 barycentrics = intersection.triangle_barycentric_coord;
@@ -145,6 +145,26 @@ kernel void pathTraceKernel(
             );
 
             float3 hitPoint = r.origin + r.direction * hitDistance;
+
+            if (bounce == 0) {
+                float4 currentClip = uniforms.currentViewProjection * float4(hitPoint, 1.0f);
+                float4 prevClip = uniforms.previousViewProjection * float4(hitPoint, 1.0f);
+
+                if (abs(currentClip.w) > 1e-5f) {
+                    float currentNdcDepth = currentClip.z / currentClip.w;
+                    primaryDepth = saturate(currentNdcDepth * 0.5f + 0.5f);
+                }
+
+                if (abs(currentClip.w) > 1e-5f && abs(prevClip.w) > 1e-5f) {
+                    float2 currentUV = (currentClip.xy / currentClip.w) * 0.5f + 0.5f;
+                    float2 prevUV = (prevClip.xy / prevClip.w) * 0.5f + 0.5f;
+                    currentUV.y = 1.0f - currentUV.y;
+                    prevUV.y = 1.0f - prevUV.y;
+                    primaryMotion = (prevUV - currentUV) * float2(uniforms.renderWidth, uniforms.renderHeight);
+                }
+
+                hasPrimaryHit = true;
+            }
 
             // Get material
             Material mat = materials[v0.materialIndex];
@@ -233,23 +253,18 @@ kernel void pathTraceKernel(
 
         totalRadiance += radiance;
         totalDepth    += primaryDepth;
+        if (hasPrimaryHit) {
+            totalMotion += primaryMotion;
+            motionSamples += 1;
+        }
     }
 
     float invSpp = 1.0f / float(uniforms.samplesPerPixel);
     float3 finalColor = totalRadiance * invSpp;
     float  finalDepth = totalDepth * invSpp;
+    float2 finalMotion = motionSamples > 0 ? totalMotion / float(motionSamples) : float2(0.0f);
 
     colorOutput.write(float4(finalColor, 1.0f), tid);
     depthOutput.write(float4(finalDepth, 0.0f, 0.0f, 1.0f), tid);
-
-    // ── Motion vectors for MetalFX ──
-    float2 ndcCurrent = uv * 2.0f - 1.0f;
-    ndcCurrent.y = -ndcCurrent.y;
-    float4 worldPos = uniforms.inverseViewProjection * float4(ndcCurrent, finalDepth / 1000.0f, 1.0f);
-    worldPos /= worldPos.w;
-    float4 prevClip = uniforms.previousViewProjection * worldPos;
-    float2 prevUV = (prevClip.xy / prevClip.w) * 0.5f + 0.5f;
-    prevUV.y = 1.0f - prevUV.y;
-    float2 motion = (prevUV - uv) * float2(uniforms.renderWidth, uniforms.renderHeight);
-    motionOutput.write(float4(motion, 0.0f, 1.0f), tid);
+    motionOutput.write(float4(finalMotion, 0.0f, 1.0f), tid);
 }

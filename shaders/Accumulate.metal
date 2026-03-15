@@ -48,11 +48,12 @@ kernel void tonemapKernel(
     uint2 outputSize = uint2(uniforms.outputWidth, uniforms.outputHeight);
     if (tid.x >= outputSize.x || tid.y >= outputSize.y) return;
 
-    // If render resolution != output resolution, do nearest-neighbor sample
-    float2 scale = float2(uniforms.renderWidth, uniforms.renderHeight) /
-                   float2(outputSize);
+    uint2 inputSize = uint2(hdrInput.get_width(), hdrInput.get_height());
+
+    // If input resolution != output resolution, do nearest-neighbor sample.
+    float2 scale = float2(inputSize) / float2(outputSize);
     uint2 srcCoord = uint2(float2(tid) * scale);
-    srcCoord = min(srcCoord, uint2(uniforms.renderWidth - 1, uniforms.renderHeight - 1));
+    srcCoord = min(srcCoord, inputSize - 1);
 
     constexpr float exposure = 4.0f;
     float3 hdr = hdrInput.read(srcCoord).rgb * exposure;

@@ -13,6 +13,7 @@ import MetalFX
 class MetalFXUpscaler {
     let device: MTLDevice
     private var temporalScaler: MTLFXTemporalScaler?
+    private var pendingReset = true
 
     private var inputWidth: Int = 0
     private var inputHeight: Int = 0
@@ -52,6 +53,7 @@ class MetalFXUpscaler {
         desc.outputTextureFormat = outputFormat
 
         temporalScaler = desc.makeTemporalScaler(device: device)
+        pendingReset = true
 
         if temporalScaler == nil {
             print("[MetalFX] WARNING: Failed to create temporal scaler. MetalFX may not be supported.")
@@ -80,19 +82,22 @@ class MetalFXUpscaler {
         guard let scaler = temporalScaler,
               let output = outputTexture else { return }
 
+        scaler.inputContentWidth = inputWidth
+        scaler.inputContentHeight = inputHeight
         scaler.colorTexture = colorTexture
         scaler.depthTexture = depthTexture
         scaler.motionTexture = motionTexture
         scaler.outputTexture = output
         scaler.jitterOffsetX = jitterX
         scaler.jitterOffsetY = jitterY
-        scaler.reset = false
+        scaler.reset = pendingReset
 
         scaler.encode(commandBuffer: commandBuffer)
+        pendingReset = false
     }
 
     func reset() {
-        temporalScaler?.reset = true
+        pendingReset = true
     }
 
     var isAvailable: Bool {

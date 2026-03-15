@@ -165,7 +165,7 @@ class GameView: NSView, CALayerDelegate {
         }
 
         // Update title with stats
-        let spp = renderer.accumulationCount
+        let spp = max(renderer.accumulationCount, 1)
         window?.title = String(format: "RT Path Tracer — %d spp", spp)
     }
 

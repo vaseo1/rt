@@ -4,6 +4,7 @@ import simd
 // ─── GPU Uniforms (must match Common.metal layout exactly) ───────────────────
 
 struct Uniforms {
+    var currentViewProjection: float4x4
     var inverseViewProjection: float4x4
     var previousViewProjection: float4x4
     var cameraPosition: (Float, Float, Float)
@@ -83,17 +84,13 @@ class PathTracer {
 
     func ensureTextures(renderWidth: Int, renderHeight: Int,
                         outputWidth: Int, outputHeight: Int) -> Bool {
-        // Quantize render dimensions to 8-pixel steps to avoid recreating textures every frame
-        let qW = max(8, (renderWidth + 3) / 8 * 8)
-        let qH = max(8, (renderHeight + 3) / 8 * 8)
-
-        if qW == currentRenderWidth && qH == currentRenderHeight
+        if renderWidth == currentRenderWidth && renderHeight == currentRenderHeight
             && outputWidth == self.outputWidth && outputHeight == self.outputHeight {
             return false
         }
 
-        currentRenderWidth = qW
-        currentRenderHeight = qH
+        currentRenderWidth = renderWidth
+        currentRenderHeight = renderHeight
         self.outputWidth = outputWidth
         self.outputHeight = outputHeight
 
@@ -120,17 +117,14 @@ class PathTracer {
         return true
     }
 
-    func encode(commandBuffer: MTLCommandBuffer,
-                uniforms: inout Uniforms,
-                accelStructure: MTLAccelerationStructure,
-                scene: SceneGeometry) {
+    func encodePathTrace(commandBuffer: MTLCommandBuffer,
+                         uniforms: inout Uniforms,
+                         accelStructure: MTLAccelerationStructure,
+                         scene: SceneGeometry) {
 
         guard let colorTex = colorTexture,
               let depthTex = depthTexture,
               let motionTex = motionTexture,
-              let historyTex = historyTexture,
-              let accumTex = accumulatedTexture,
-              let tonemapTex = tonemappedTexture,
               let vertexBuf = scene.vertexBuffer,
               let indexBuf = scene.indexBuffer,
               let materialBuf = scene.materialBuffer,
@@ -141,8 +135,6 @@ class PathTracer {
 
         let renderW = Int(uniforms.renderWidth)
         let renderH = Int(uniforms.renderHeight)
-        let outW = Int(uniforms.outputWidth)
-        let outH = Int(uniforms.outputHeight)
 
         // ── 1. Path Trace ──
 
@@ -166,6 +158,18 @@ class PathTracer {
             encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
             encoder.endEncoding()
         }
+    }
+
+    func encodeAccumulation(commandBuffer: MTLCommandBuffer,
+                            uniforms: inout Uniforms) {
+        guard let colorTex = colorTexture,
+              let historyTex = historyTexture,
+              let accumTex = accumulatedTexture else {
+            return
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
 
         // ── 2. Accumulate ──
 
@@ -182,6 +186,13 @@ class PathTracer {
             encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
             encoder.endEncoding()
         }
+    }
+
+    func copyAccumulationToHistory(commandBuffer: MTLCommandBuffer) {
+        guard let historyTex = historyTexture,
+              let accumTex = accumulatedTexture else {
+            return
+        }
 
         // Copy accumulated → history for next frame
         if let blit = commandBuffer.makeBlitCommandEncoder() {
@@ -189,6 +200,17 @@ class PathTracer {
             blit.copy(from: accumTex, to: historyTex)
             blit.endEncoding()
         }
+    }
+
+    func encodeTonemap(commandBuffer: MTLCommandBuffer,
+                       uniforms: inout Uniforms,
+                       sourceTexture: MTLTexture) {
+        guard let tonemapTex = tonemappedTexture else {
+            return
+        }
+
+        let outW = Int(uniforms.outputWidth)
+        let outH = Int(uniforms.outputHeight)
 
         // ── 3. Tonemap ──
 
@@ -196,7 +218,7 @@ class PathTracer {
             encoder.label = "Tonemap"
             encoder.setComputePipelineState(tonemapPipeline)
             encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 0)
-            encoder.setTexture(accumTex, index: 0)
+            encoder.setTexture(sourceTexture, index: 0)
             encoder.setTexture(tonemapTex, index: 1)
 
             let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)

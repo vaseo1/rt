@@ -123,6 +123,10 @@ class Camera {
         if haltonIndex > 255 { haltonIndex = 0 }
     }
 
+    func syncHistory() {
+        previousViewProjectionMatrix = viewProjectionMatrix
+    }
+
     func resetAccumulation() {
         haltonIndex = 0
     }

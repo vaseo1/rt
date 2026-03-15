@@ -8,7 +8,7 @@ import simd
 //
 // Orchestrates the full render pipeline:
 //   1. Path trace at full resolution, 8 bounces
-//   2. Accumulate over frames (reset on camera move)
+//   2. MetalFX temporal filtering while moving, accumulation while still
 //   3. Tonemap + present to drawable
 
 class Renderer {
@@ -39,6 +39,7 @@ class Renderer {
     private(set) var captureInProgress = false
     private var submittedFrames: UInt32 = 0
     private var completedFrames: UInt32 = 0
+    private var previousCameraMoving = false
 
     init(device: MTLDevice, view: GameView) {
         self.device = device
@@ -47,6 +48,7 @@ class Renderer {
         self.pathTracer = PathTracer(device: device, commandQueue: commandQueue)
         self.accelBuilder = AccelStructureBuilder(device: device, commandQueue: commandQueue)
         self.scene = SceneGeometry(device: device)
+        self.upscaler = MetalFXUpscaler(device: device)
 
         let scale = view.window?.backingScaleFactor ?? 2.0
         outputWidth = Int(view.bounds.width * scale)
@@ -136,29 +138,52 @@ class Renderer {
         let renderH = outputHeight
 
         camera.aspectRatio = Float(outputWidth) / Float(outputHeight)
-
-        // ── Accumulation logic ──
-        if camera.isMoving {
-            accumulationCount = 1
-            camera.resetAccumulation()
-        } else {
-            accumulationCount += 1
-        }
+        let isMoving = camera.isMoving
+        let startedMoving = isMoving && !previousCameraMoving
+        let stoppedMoving = !isMoving && previousCameraMoving
+        let jitter = camera.jitterOffset
         camera.advanceJitter()
 
+        // ── Ensure textures / temporal state ──
+        let texturesChanged = pathTracer.ensureTextures(renderWidth: renderW, renderHeight: renderH,
+                                 outputWidth: outputWidth, outputHeight: outputHeight)
+        if texturesChanged {
+            camera.syncHistory()
+            accumulationCount = 0
+            upscaler?.reset()
+        }
+
+        upscaler?.configure(inputWidth: renderW,
+                            inputHeight: renderH,
+                            outputWidth: outputWidth,
+                            outputHeight: outputHeight)
+
+        // ── Accumulation logic ──
+        if isMoving {
+            if startedMoving {
+                accumulationCount = 0
+                upscaler?.reset()
+            }
+        } else {
+            if stoppedMoving {
+                accumulationCount = 0
+            }
+            accumulationCount += 1
+        }
+
         // ── Build uniforms ──
-        let jitter = camera.jitterOffset
         let pos = camera.position
         let right = camera.rightVector
         let up = camera.upVector
         let forward = camera.forwardVector
         var uniforms = Uniforms(
+            currentViewProjection: camera.viewProjectionMatrix,
             inverseViewProjection: camera.inverseViewProjectionMatrix,
             previousViewProjection: camera.previousViewProjectionMatrix,
             cameraPosition: (pos.x, pos.y, pos.z),
             frameIndex: frameIndex,
             cameraRight: (right.x, right.y, right.z),
-            accumulationCount: accumulationCount,
+            accumulationCount: max(accumulationCount, 1),
             cameraUp: (up.x, up.y, up.z),
             samplesPerPixel: 1,
             cameraForward: (forward.x, forward.y, forward.z),
@@ -174,15 +199,6 @@ class Renderer {
             lightCount: UInt32(scene.lightCount)
         )
 
-        // ── Ensure textures ──
-        let texturesChanged = pathTracer.ensureTextures(renderWidth: renderW, renderHeight: renderH,
-                                 outputWidth: outputWidth, outputHeight: outputHeight)
-        if texturesChanged {
-            accumulationCount = 1
-            camera.resetAccumulation()
-            uniforms.accumulationCount = accumulationCount
-        }
-
         // ── Encode ──
         guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         submittedFrames += 1
@@ -192,10 +208,40 @@ class Renderer {
             print("[Renderer] Submit frame #\(submittedFrame) accumulation=\(accumulationCount) render=\(renderW)x\(renderH) output=\(outputWidth)x\(outputHeight) moving=\(camera.isMoving)")
         }
 
-        pathTracer.encode(commandBuffer: commandBuffer,
-                          uniforms: &uniforms,
-                          accelStructure: accelStructure,
-                          scene: scene)
+        pathTracer.encodePathTrace(commandBuffer: commandBuffer,
+                                   uniforms: &uniforms,
+                                   accelStructure: accelStructure,
+                                   scene: scene)
+
+        let hdrSource: MTLTexture?
+        if isMoving {
+            if let upscaler,
+               let colorTexture = pathTracer.colorTexture,
+               let depthTexture = pathTracer.depthTexture,
+               let motionTexture = pathTracer.motionTexture {
+                upscaler.encode(commandBuffer: commandBuffer,
+                                colorTexture: colorTexture,
+                                depthTexture: depthTexture,
+                                motionTexture: motionTexture,
+                                jitterX: jitter.x,
+                                jitterY: jitter.y)
+                hdrSource = upscaler.outputTexture ?? colorTexture
+            } else {
+                hdrSource = pathTracer.colorTexture
+            }
+        } else {
+            pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
+                                          uniforms: &uniforms)
+            pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
+            hdrSource = pathTracer.accumulatedTexture
+        }
+
+        if let hdrSource {
+            pathTracer.encodeTonemap(commandBuffer: commandBuffer,
+                                     uniforms: &uniforms,
+                                     sourceTexture: hdrSource)
+        }
+        previousCameraMoving = isMoving
 
         // ── Present ──
         guard let tonemapped = pathTracer.tonemappedTexture else { return }
@@ -241,19 +287,15 @@ class Renderer {
                 }
 
                 if let tex = self.pathTracer.tonemappedTexture {
-                if needsVerify {
-                    self.performVerifyCapture(texture: tex)
-                        defer {
-                            if !needsVerify {
-                                DispatchQueue.main.async {
-                                    self.captureInProgress = false
-                                }
-                            }
+                    if needsVerify {
+                        self.performVerifyCapture(texture: tex)
+                    } else if needsScreenshot {
+                        self.performInteractiveScreenshot(texture: tex)
+                        DispatchQueue.main.async {
+                            self.captureInProgress = false
                         }
-                } else if needsScreenshot {
-                    self.performInteractiveScreenshot(texture: tex)
+                    }
                 }
-            }
             }
             onComplete?()
         }
@@ -267,6 +309,7 @@ class Renderer {
         outputWidth = max(1, width)
         outputHeight = max(1, height)
         accumulationCount = 0
+        upscaler?.reset()
     }
 
     // MARK: - Screenshot & Verification
