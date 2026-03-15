@@ -26,6 +26,14 @@ class Renderer {
     private let lookAtWaterOnLoad: Bool
     private let highlightWater: Bool
     private var environmentSettings = EnvironmentSettings.default
+    private var currentExposure: Float = 4.0
+    private var measuredAverageLuminance: Float = 0.18
+    private var lastExposureUpdateTime = CACurrentMediaTime()
+    private let exposureKeyValue: Float = 0.18
+    private let minAutoExposure: Float = 0.35
+    private let maxAutoExposure: Float = 8.0
+    private let darkToBrightAdaptationRate: Float = 3.0
+    private let brightToDarkAdaptationRate: Float = 1.35
 
     // Resolution
     private var outputWidth: Int = 2560
@@ -216,6 +224,10 @@ class Renderer {
         let stoppedMoving = !isMoving && previousCameraMoving
         let jitter = camera.jitterOffset
         camera.advanceJitter()
+        let now = CACurrentMediaTime()
+        let exposureDeltaTime = min(max(Float(now - lastExposureUpdateTime), 1.0 / 240.0), 0.25)
+        lastExposureUpdateTime = now
+        updateExposure(deltaTime: exposureDeltaTime)
 
         // ── Ensure textures / temporal state ──
         let texturesChanged = pathTracer.ensureTextures(renderWidth: renderW, renderHeight: renderH,
@@ -278,7 +290,11 @@ class Renderer {
             environmentSunDirection: (environmentSettings.sunDirection.x,
                                       environmentSettings.sunDirection.y,
                                       environmentSettings.sunDirection.z),
-            environmentSunIntensity: environmentSettings.sunIntensity
+            environmentSunIntensity: environmentSettings.sunIntensity,
+            exposure: currentExposure,
+            exposurePadding0: 0,
+            exposurePadding1: 0,
+            exposurePadding2: 0
         )
 
         // ── Encode ──
@@ -318,7 +334,10 @@ class Renderer {
             hdrSource = pathTracer.accumulatedTexture
         }
 
+        let hasExposureMeasurement = hdrSource != nil
         if let hdrSource {
+            pathTracer.encodeExposureMeasurement(commandBuffer: commandBuffer,
+                                                sourceTexture: hdrSource)
             pathTracer.encodeTonemap(commandBuffer: commandBuffer,
                                      uniforms: &uniforms,
                                      sourceTexture: hdrSource)
@@ -356,6 +375,13 @@ class Renderer {
         commandBuffer.addCompletedHandler { [weak self] buffer in
             // Screenshot / verify capture (GPU work is done, off main thread)
             if let self = self {
+                if hasExposureMeasurement {
+                    let measuredAverageLuminance = self.pathTracer.readMeasuredAverageLuminance()
+                    DispatchQueue.main.async {
+                        self.measuredAverageLuminance = measuredAverageLuminance
+                    }
+                }
+
                 self.completedFrames += 1
                 let elapsedMs = (CACurrentMediaTime() - submitTime) * 1000.0
                 if self.verifyConfig.enabled && submittedFrame <= 8 {
@@ -441,6 +467,22 @@ class Renderer {
         case .error: return "error"
         @unknown default: return "unknown"
         }
+    }
+
+    private func updateExposure(deltaTime: Float) {
+        let targetExposure = desiredExposure(forAverageLuminance: measuredAverageLuminance)
+        let adaptationRate = targetExposure < currentExposure
+            ? darkToBrightAdaptationRate
+            : brightToDarkAdaptationRate
+        let blend = 1.0 - exp(-adaptationRate * deltaTime)
+        currentExposure += (targetExposure - currentExposure) * blend
+        currentExposure = min(max(currentExposure, minAutoExposure), maxAutoExposure)
+    }
+
+    private func desiredExposure(forAverageLuminance averageLuminance: Float) -> Float {
+        let safeLuminance = max(averageLuminance, 1e-4)
+        let targetExposure = exposureKeyValue / safeLuminance
+        return min(max(targetExposure, minAutoExposure), maxAutoExposure)
     }
 
     // MARK: - Helpers

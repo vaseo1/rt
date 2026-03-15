@@ -80,6 +80,10 @@ struct Uniforms {
     float    environmentIntensity;
     packed_float3 environmentSunDirection;
     float    environmentSunIntensity;
+    float    exposure;
+    float    exposurePadding0;
+    float    exposurePadding1;
+    float    exposurePadding2;
 };
 
 inline float3 sampleProceduralEnvironment(float3 direction, constant Uniforms& uniforms) {

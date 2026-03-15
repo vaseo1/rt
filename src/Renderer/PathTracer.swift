@@ -29,6 +29,10 @@ struct Uniforms {
     var environmentIntensity: Float
     var environmentSunDirection: (Float, Float, Float)
     var environmentSunIntensity: Float
+    var exposure: Float
+    var exposurePadding0: Float
+    var exposurePadding1: Float
+    var exposurePadding2: Float
 }
 
 // ─── Path Tracer Pipeline ────────────────────────────────────────────────────
@@ -42,7 +46,9 @@ class PathTracer {
 
     private var pathTracePipeline: MTLComputePipelineState!
     private var accumulatePipeline: MTLComputePipelineState!
+    private var measureExposurePipeline: MTLComputePipelineState!
     private var tonemapPipeline: MTLComputePipelineState!
+    private let exposureReadbackBuffer: MTLBuffer
 
     // Render targets at current internal resolution
     private(set) var colorTexture: MTLTexture?
@@ -60,6 +66,12 @@ class PathTracer {
     init(device: MTLDevice, commandQueue: MTLCommandQueue) {
         self.device = device
         self.commandQueue = commandQueue
+        guard let exposureReadbackBuffer = device.makeBuffer(length: MemoryLayout<Float>.stride,
+                                                             options: .storageModeShared) else {
+            fatalError("Failed to allocate exposure readback buffer")
+        }
+        self.exposureReadbackBuffer = exposureReadbackBuffer
+        exposureReadbackBuffer.contents().assumingMemoryBound(to: Float.self).pointee = 0.18
         buildPipelines()
     }
 
@@ -81,6 +93,7 @@ class PathTracer {
 
         pathTracePipeline = makePipeline("pathTraceKernel")
         accumulatePipeline = makePipeline("accumulateKernel")
+        measureExposurePipeline = makePipeline("measureExposureKernel")
         tonemapPipeline = makePipeline("tonemapKernel")
     }
 
@@ -202,6 +215,26 @@ class PathTracer {
             blit.copy(from: accumTex, to: historyTex)
             blit.endEncoding()
         }
+    }
+
+    func encodeExposureMeasurement(commandBuffer: MTLCommandBuffer,
+                                   sourceTexture: MTLTexture) {
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Measure Exposure"
+            encoder.setComputePipelineState(measureExposurePipeline)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setBuffer(exposureReadbackBuffer, offset: 0, index: 0)
+
+            let gridSize = MTLSize(width: 1, height: 1, depth: 1)
+            let threadgroupSize = MTLSize(width: 1, height: 1, depth: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+    }
+
+    func readMeasuredAverageLuminance() -> Float {
+        let value = exposureReadbackBuffer.contents().assumingMemoryBound(to: Float.self).pointee
+        return max(value, 1e-4)
     }
 
     func encodeTonemap(commandBuffer: MTLCommandBuffer,
