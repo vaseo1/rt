@@ -3,6 +3,16 @@
 
 using namespace metal;
 
+// ─── Clear a half-float texture to zero ──────────────────────────────────────
+
+kernel void clearR16Kernel(
+    uint2 tid [[thread_position_in_grid]],
+    texture2d<float, access::write> output [[texture(0)]]
+) {
+    if (tid.x >= output.get_width() || tid.y >= output.get_height()) return;
+    output.write(float4(0.0f), tid);
+}
+
 struct SVGFATrousUniforms {
     uint renderWidth;
     uint renderHeight;

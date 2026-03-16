@@ -8,6 +8,7 @@ enum RenderMode: String, CaseIterable {
     case accumulation
     case svgf
     case metalfx
+    case metalfxSVGF = "metalfx-svgf"
 
     var displayName: String {
         switch self {
@@ -21,6 +22,8 @@ enum RenderMode: String, CaseIterable {
             return "SVGF"
         case .metalfx:
             return "MetalFX"
+        case .metalfxSVGF:
+            return "MetalFX+SVGF"
         }
     }
 

@@ -78,6 +78,7 @@ class PathTracer {
     private var svgfATrousPipeline: MTLComputePipelineState!
     private var svgfRemodPipeline: MTLComputePipelineState!
     private var svgfDemodPipeline: MTLComputePipelineState!
+    private var clearR16Pipeline: MTLComputePipelineState!
     private var measureExposurePipeline: MTLComputePipelineState!
     private var extractBloomPipeline: MTLComputePipelineState!
     private var blurBloomPipeline: MTLComputePipelineState!
@@ -159,6 +160,7 @@ class PathTracer {
         svgfATrousPipeline = makePipeline("svgfATrousKernel")
         svgfRemodPipeline = makePipeline("svgfRemodulateKernel")
         svgfDemodPipeline = makePipeline("svgfDemodulateKernel")
+        clearR16Pipeline = makePipeline("clearR16Kernel")
         measureExposurePipeline = makePipeline("measureExposureKernel")
         extractBloomPipeline = makePipeline("extractBloomKernel")
         blurBloomPipeline = makePipeline("blurBloomKernel")
@@ -438,6 +440,125 @@ class PathTracer {
         }
 
         return svgfFilteredTexture
+    }
+
+    /// Spatial-only denoise: demodulate → À-Trous → remodulate (no temporal pass).
+    /// Suitable as a pre-filter before MetalFX temporal upscaling.
+    func encodeSpatialDenoise(commandBuffer: MTLCommandBuffer,
+                              uniforms: inout Uniforms,
+                              sourceTexture: MTLTexture) -> MTLTexture? {
+        guard let depthTex = depthTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
+              let pingTex = svgfPingTexture,
+              let pongTex = svgfPongTexture else {
+            return nil
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+        let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+
+        var filterUniforms = SVGFATrousUniforms(
+            renderWidth: uniforms.renderWidth,
+            renderHeight: uniforms.renderHeight,
+            stepWidth: 1,
+            passIndex: 0,
+            colorPhiScale: 2.0,
+            normalPhi: 128.0,
+            depthPhi: 2.0,
+            albedoPhi: 12.0
+        )
+
+        // Demodulate: radiance → irradiance (into pingTex)
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Spatial Demodulate"
+            encoder.setComputePipelineState(svgfDemodPipeline)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(pingTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        // Clear history length scratch to zero so À-Trous applies full spatial filtering
+        if let hlTex = svgfHistoryLengthScratchTexture {
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "Clear HistoryLength"
+                encoder.setComputePipelineState(clearR16Pipeline)
+                encoder.setTexture(hlTex, index: 0)
+                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                encoder.endEncoding()
+            }
+        }
+
+        // Clear moments so À-Trous uses colorPhiScale-driven filtering
+        if let momentsTex = svgfMomentsTexture {
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "Clear Moments"
+                encoder.setComputePipelineState(clearR16Pipeline)
+                encoder.setTexture(momentsTex, index: 0)
+                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                encoder.endEncoding()
+            }
+        }
+
+        // À-Trous passes on irradiance (ping-pong)
+        var srcTex: MTLTexture = pingTex
+        var dstTex: MTLTexture = pongTex
+
+        if let momentsTex = svgfMomentsTexture {
+            let spatialStepWidths: [UInt32] = [1, 2]
+
+            for (passIndex, stepWidth) in spatialStepWidths.enumerated() {
+                filterUniforms.stepWidth = stepWidth
+                filterUniforms.passIndex = UInt32(passIndex)
+
+                if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                    encoder.label = "Spatial A-Trous \(passIndex)"
+                    encoder.setComputePipelineState(svgfATrousPipeline)
+                    encoder.setBytes(&filterUniforms,
+                                     length: MemoryLayout<SVGFATrousUniforms>.size,
+                                     index: 0)
+                    encoder.setTexture(srcTex, index: 0)
+                    encoder.setTexture(momentsTex, index: 1)
+                    encoder.setTexture(depthTex, index: 2)
+                    encoder.setTexture(normalTex, index: 3)
+                    encoder.setTexture(albedoTex, index: 4)
+                    encoder.setTexture(dstTex, index: 5)
+                    // historyLength cleared to 0 → adaptiveScale = max
+                    // which means full spatial filtering (no convergence cutoff).
+                    if let hlTex = svgfHistoryLengthScratchTexture {
+                        encoder.setTexture(hlTex, index: 6)
+                    }
+                    encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                    encoder.endEncoding()
+                }
+
+                let previousTarget = dstTex
+                srcTex = previousTarget
+                dstTex = (previousTarget === pingTex) ? pongTex : pingTex
+            }
+        }
+
+        // Remodulate: irradiance × albedo → radiance
+        let remodSource = srcTex
+        let remodTarget = dstTex
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Spatial Remodulate"
+            encoder.setComputePipelineState(svgfRemodPipeline)
+            encoder.setTexture(remodSource, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(remodTarget, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        return remodTarget
     }
 
     func encodeExposureMeasurement(commandBuffer: MTLCommandBuffer,

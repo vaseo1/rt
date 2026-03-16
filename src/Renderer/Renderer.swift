@@ -99,7 +99,7 @@ class Renderer {
             return "1 spp"
         case .accumulation:
             return "\(max(accumulationCount, 1)) spp"
-        case .svgf, .metalfx:
+        case .svgf, .metalfx, .metalfxSVGF:
             return "\(max(accumulationCount, 1)) history"
         case .auto:
             return "\(max(accumulationCount, 1)) history"
@@ -272,7 +272,7 @@ class Renderer {
         updateExposure(deltaTime: exposureDeltaTime)
 
         let requestedRenderMode = preferredRenderMode(isMoving: isMoving)
-        let wantsMetalFX = requestedRenderMode == .metalfx && upscaler?.supportsMetalFX == true
+        let wantsMetalFX = (requestedRenderMode == .metalfx || requestedRenderMode == .metalfxSVGF) && upscaler?.supportsMetalFX == true
         let renderScale = wantsMetalFX ? metalFXRenderScale : 1.0
         let renderW = max(1, Int((Float(outputWidth) * renderScale).rounded(.toNearestOrAwayFromZero)))
         let renderH = max(1, Int((Float(outputHeight) * renderScale).rounded(.toNearestOrAwayFromZero)))
@@ -311,6 +311,19 @@ class Renderer {
             }
             accumulationCount += 1
         case .metalfx:
+            if isMoving {
+                accumulationCount = 0
+                if startedMoving {
+                    upscaler?.reset()
+                }
+            } else {
+                if stoppedMoving {
+                    accumulationCount = 0
+                    upscaler?.reset()
+                }
+                accumulationCount += 1
+            }
+        case .metalfxSVGF:
             if isMoving {
                 accumulationCount = 0
                 if startedMoving {
@@ -411,6 +424,35 @@ class Renderer {
                     metalFXInput = pathTracer.accumulatedTexture ?? colorTexture
                 }
 
+                upscaler.encode(commandBuffer: commandBuffer,
+                                colorTexture: metalFXInput,
+                                depthTexture: depthTexture,
+                                motionTexture: motionTexture,
+                                jitterX: jitter.x,
+                                jitterY: jitter.y)
+                hdrSource = upscaler.outputTexture ?? metalFXInput
+            } else {
+                hdrSource = pathTracer.colorTexture
+            }
+        case .metalfxSVGF:
+            if let upscaler,
+               let colorTexture = pathTracer.colorTexture,
+               let depthTexture = pathTracer.depthTexture,
+               let motionTexture = pathTracer.motionTexture {
+                let metalFXInput: MTLTexture
+                if isMoving {
+                    // Spatial pre-denoise on raw 1-spp to help MetalFX temporal
+                    metalFXInput = pathTracer.encodeSpatialDenoise(
+                        commandBuffer: commandBuffer,
+                        uniforms: &uniforms,
+                        sourceTexture: colorTexture) ?? colorTexture
+                } else {
+                    // Accumulate for convergence, feed clean frame to MetalFX
+                    pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
+                                                 uniforms: &uniforms)
+                    pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
+                    metalFXInput = pathTracer.accumulatedTexture ?? colorTexture
+                }
                 upscaler.encode(commandBuffer: commandBuffer,
                                 colorTexture: metalFXInput,
                                 depthTexture: depthTexture,
@@ -587,7 +629,7 @@ class Renderer {
     }
 
     private func resolvedRenderMode(requestedMode: RenderMode) -> RenderMode {
-        if requestedMode == .metalfx && upscaler?.isAvailable != true {
+        if (requestedMode == .metalfx || requestedMode == .metalfxSVGF) && upscaler?.isAvailable != true {
             return .raw
         }
 
