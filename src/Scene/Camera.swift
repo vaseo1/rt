@@ -113,6 +113,16 @@ class Camera {
         viewProjectionMatrix.inverse
     }
 
+    var compactPositionString: String {
+        String(format: "%.0f,%.0f,%.0f", position.x, position.y, position.z)
+    }
+
+    var compactViewString: String {
+        let yawDegrees = normalizedDegrees(for: yaw)
+        let pitchDegrees = pitch * 180.0 / .pi
+        return String(format: "%.0f/%.0f", yawDegrees, pitchDegrees)
+    }
+
     // Halton sequence for sub-pixel jitter (base 2, base 3)
     var jitterOffset: SIMD2<Float> {
         let idx = haltonIndex
@@ -154,6 +164,12 @@ class Camera {
             i /= base
         }
         return result
+    }
+
+    private func normalizedDegrees(for radians: Float) -> Float {
+        let degrees = radians * 180.0 / .pi
+        return degrees >= 0 ? degrees.truncatingRemainder(dividingBy: 360.0)
+                            : degrees.truncatingRemainder(dividingBy: 360.0) + 360.0
     }
 }
 

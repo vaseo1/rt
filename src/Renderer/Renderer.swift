@@ -23,6 +23,7 @@ class Renderer {
     private var accelBuilder: AccelStructureBuilder
     private var scene: SceneGeometry
     private var upscaler: MetalFXUpscaler?
+    private(set) var sceneTitleLabel: String = "test"
     private let startupCameraPosition: SIMD3<Float>?
     private let startupLookAtPosition: SIMD3<Float>?
     private let lookAtWaterOnLoad: Bool
@@ -106,6 +107,21 @@ class Renderer {
         }
     }
 
+    var renderModeDetailCompact: String {
+        switch activeRenderMode {
+        case .raw:
+            return "1spp"
+        case .accumulation:
+            return "\(max(accumulationCount, 1))spp"
+        case .svgf, .metalfx, .metalfxSVGF, .auto:
+            return "\(max(accumulationCount, 1))h"
+        }
+    }
+
+    var windowTitle: String {
+        "RT Path Tracer | \(sceneTitleLabel) | p\(camera.compactPositionString) | v\(camera.compactViewString) | \(renderModeTitle) \(renderModeDetailCompact)"
+    }
+
     func cycleRenderMode() {
         guard let currentIndex = RenderMode.allCases.firstIndex(of: selectedRenderMode) else {
             return
@@ -126,6 +142,8 @@ class Renderer {
         // Try to find Quake assets
         let assetsDir = findAssetsDirectory()
         var bspData: BSPData?
+        let requestedMapName = "e1m1"
+        let requestedMapPath = "maps/\(requestedMapName).bsp"
 
         // Load Quake palette for texture decoding
         let pakPath = assetsDir.appendingPathComponent("pak0.pak")
@@ -138,11 +156,12 @@ class Renderer {
         }
 
         // 1. Try loading .bsp directly
-        let bspPath = assetsDir.appendingPathComponent("e1m1.bsp")
+        let bspPath = assetsDir.appendingPathComponent("\(requestedMapName).bsp")
         if FileManager.default.fileExists(atPath: bspPath.path) {
             print("[Renderer] Loading BSP from: \(bspPath.path)")
             do {
                 bspData = try BSPLoader().load(from: bspPath, palette: palette)
+                sceneTitleLabel = requestedMapName
             } catch {
                 print("[Renderer] Failed to load BSP: \(error)")
             }
@@ -153,8 +172,9 @@ class Renderer {
             if FileManager.default.fileExists(atPath: pakPath.path) {
                 print("[Renderer] Loading from PAK: \(pakPath.path)")
                 do {
-                    let pakData = try PAKLoader().extractBSP(from: pakPath, mapName: "maps/e1m1.bsp")
+                    let pakData = try PAKLoader().extractBSP(from: pakPath, mapName: requestedMapPath)
                     bspData = try BSPLoader().load(data: pakData, palette: palette)
+                    sceneTitleLabel = requestedMapName
                 } catch {
                     print("[Renderer] Failed to load PAK: \(error)")
                 }
@@ -164,8 +184,9 @@ class Renderer {
         // 3. Fallback: generate a test scene
         if bspData == nil {
             print("[Renderer] No Quake assets found. Generating test scene.")
-            print("[Renderer] Place pak0.pak or e1m1.bsp in: \(assetsDir.path)")
+            print("[Renderer] Place pak0.pak or \(requestedMapName).bsp in: \(assetsDir.path)")
             bspData = generateTestScene()
+            sceneTitleLabel = "test"
         }
 
         guard let data = bspData else { return }

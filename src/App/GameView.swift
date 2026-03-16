@@ -167,8 +167,8 @@ class GameView: NSView, CALayerDelegate {
             self?.frameSemaphore.signal()
         }
 
-        // Update title with stats
-        window?.title = "RT Path Tracer — \(renderer.renderModeTitle) — \(renderer.renderModeDetail)"
+        // Update title with compact scene, camera, and render state.
+        window?.title = renderer.windowTitle
     }
 
     deinit {
