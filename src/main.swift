@@ -45,7 +45,7 @@ struct LaunchConfig {
     var lookAtPosition: SIMD3<Float>?
     var lookAtWater = false
     var highlightWater = false
-    var renderMode: RenderMode = .auto
+    var renderMode: RenderMode = .accumulation
 }
 
 private func failArgumentParsing(_ message: String) -> Never {
