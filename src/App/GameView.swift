@@ -3,6 +3,53 @@ import Metal
 import QuartzCore
 
 class GameView: NSView, CALayerDelegate {
+    private struct ScriptedOIDNRepro {
+        private let baselineCaptureFrame: UInt32 = 180
+        private let movementStartFrame: UInt32 = 181
+        private let movementEndFrame: UInt32 = 204
+        private let rawPostMoveCaptureFrame: UInt32 = 210
+        private let oidnSwitchFrame: UInt32 = 211
+        private let oidnCaptureFrame: UInt32 = 450
+        private let shutdownFrame: UInt32 = 486
+
+        private(set) var frame: UInt32 = 0
+
+        mutating func advance() -> (forward: Bool, captureScreenshot: Bool, switchToOIDN: Bool, terminate: Bool) {
+            frame += 1
+
+            let isMovingForward = frame >= movementStartFrame && frame < movementEndFrame
+            let shouldCaptureScreenshot = frame == baselineCaptureFrame
+                || frame == rawPostMoveCaptureFrame
+                || frame == oidnCaptureFrame
+            let shouldSwitchToOIDN = frame == oidnSwitchFrame
+            let shouldTerminate = frame >= shutdownFrame
+            return (isMovingForward, shouldCaptureScreenshot, shouldSwitchToOIDN, shouldTerminate)
+        }
+
+        var phaseDescription: String {
+            switch frame {
+            case ..<180:
+                return "warmup"
+            case 180:
+                return "baseline-capture"
+            case 181..<204:
+                return "moving"
+            case 204..<210:
+                return "raw-settle"
+            case 210:
+                return "raw-post-move-capture"
+            case 211:
+                return "switch-to-oidn"
+            case 212..<450:
+                return "oidn-settle"
+            case 450:
+                return "oidn-post-switch-capture"
+            default:
+                return "shutdown"
+            }
+        }
+    }
+
     let device: MTLDevice
     let metalLayer: CAMetalLayer
     var renderer: Renderer?
@@ -30,10 +77,12 @@ class GameView: NSView, CALayerDelegate {
     private let keyM: UInt16 = 46
     private let keyN: UInt16 = 45
     private let keyF12: UInt16 = 111
+    private var scriptedOIDNRepro: ScriptedOIDNRepro?
 
-    init(frame: NSRect, device: MTLDevice) {
+    init(frame: NSRect, device: MTLDevice, launchConfig: LaunchConfig) {
         self.device = device
         self.metalLayer = CAMetalLayer()
+        self.scriptedOIDNRepro = launchConfig.scriptedOIDNRepro ? ScriptedOIDNRepro() : nil
 
         super.init(frame: frame)
 
@@ -137,12 +186,35 @@ class GameView: NSView, CALayerDelegate {
         let dt: Float = 1.0 / 60.0
 
         // Update camera from input
-        let forward = keysPressed.contains(keyW)
+        var forward = keysPressed.contains(keyW)
         let back    = keysPressed.contains(keyS)
         let left    = keysPressed.contains(keyA)
         let right   = keysPressed.contains(keyD)
         let up      = keysPressed.contains(keySpace)
         let sprint  = shiftPressed
+
+        if var scriptedOIDNRepro {
+            let step = scriptedOIDNRepro.advance()
+            self.scriptedOIDNRepro = scriptedOIDNRepro
+            forward = step.forward
+
+            if step.switchToOIDN {
+                print("[OIDN_REPRO] switching denoiser frame=\(scriptedOIDNRepro.frame) phase=\(scriptedOIDNRepro.phaseDescription)")
+                renderer.cycleDenoiseMethod()
+            }
+
+            if step.captureScreenshot {
+                print("[OIDN_REPRO] capture requested frame=\(scriptedOIDNRepro.frame) phase=\(scriptedOIDNRepro.phaseDescription)")
+                renderer.pendingScreenshot = true
+            }
+
+            if step.terminate {
+                print("[OIDN_REPRO] terminating frame=\(scriptedOIDNRepro.frame) phase=\(scriptedOIDNRepro.phaseDescription)")
+                DispatchQueue.main.async {
+                    NSApp.terminate(nil)
+                }
+            }
+        }
 
         renderer.camera.update(
             forward: forward, back: back,

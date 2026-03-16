@@ -21,7 +21,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         window.title = "RT Path Tracer"
         window.center()
 
-        let gameView = GameView(frame: windowRect, device: device)
+        let gameView = GameView(frame: windowRect,
+                    device: device,
+                    launchConfig: launchConfig)
         window.contentView = gameView
 
         renderer = Renderer(device: device, view: gameView, launchConfig: launchConfig)
@@ -32,7 +34,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
 
-        if !launchConfig.verifyConfig.enabled {
+        if !launchConfig.verifyConfig.enabled && !launchConfig.scriptedOIDNRepro {
             // Capture mouse for FPS-style control (skip in verify mode)
             gameView.captureMouse()
         }

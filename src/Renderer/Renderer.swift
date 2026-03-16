@@ -79,12 +79,17 @@ class Renderer {
     private var verifyReferenceLabel: String?
     private var verifyReferenceReady = false
     private var verifyReferenceTransitionPending = false
-    private let oidnQueue = DispatchQueue(label: "dev.rt.oidn", qos: .userInitiated)
+    private let oidnQueue = DispatchQueue(label: "dev.rt.oidn", qos: .userInitiated, attributes: .concurrent)
     private var oidnLatestTexture: MTLTexture?
     private var oidnLatestFrame: UInt32 = 0
     private var oidnJobInFlight = false
+    private var oidnJobStartTime: CFTimeInterval?
     private var oidnGeneration: UInt64 = 0
+    private var oidnUseAuxiliaryInputs = true
+    private var oidnRuntimeDisabledReason: String?
     private var hasLoggedOIDNAvailability = false
+    private let shouldLogOIDNEvents: Bool
+    private let oidnJobTimeout: CFTimeInterval = 8.0
 
     init(device: MTLDevice, view: GameView, launchConfig: LaunchConfig) {
         self.device = device
@@ -115,6 +120,7 @@ class Renderer {
         self.startupLookAtPosition = launchConfig.lookAtPosition
         self.lookAtWaterOnLoad = launchConfig.lookAtWater
         self.highlightWater = launchConfig.highlightWater
+        self.shouldLogOIDNEvents = launchConfig.scriptedOIDNRepro
 
         self.pathTracer = PathTracer(device: device, commandQueue: commandQueue)
         self.accelBuilder = AccelStructureBuilder(device: device, commandQueue: commandQueue)
@@ -172,8 +178,68 @@ class Renderer {
         }
     }
 
+    private var oidnStatusTitle: String? {
+        guard activeRenderMode == .accumulation,
+              selectedDenoiseMethod == .oidn else {
+            return nil
+        }
+
+        if !oidnDenoiser.isAvailable {
+            return "OIDN unavailable"
+        }
+
+        if let oidnRuntimeDisabledReason {
+            return oidnRuntimeDisabledReason
+        }
+
+        if camera.isMoving {
+            return "OIDN moving"
+        }
+
+        let targetFrame = max(accumulationCount, 1)
+        let hasPresentationTexture = currentOIDNPresentationTexture() != nil
+        let elapsed = oidnJobElapsedTime
+
+        if hasPresentationTexture {
+            if oidnJobInFlight, oidnLatestFrame < targetFrame {
+                return "\(oidnPipelineTitle) ready@\(oidnLatestFrame)spp -> \(targetFrame)spp"
+            }
+            return "\(oidnPipelineTitle) ready@\(oidnLatestFrame)spp"
+        }
+
+        if oidnJobInFlight {
+            if let elapsed, elapsed >= oidnJobTimeout {
+                return "\(oidnPipelineTitle) stalled@\(targetFrame)spp"
+            }
+            return "\(oidnPipelineTitle) pending@\(targetFrame)spp"
+        }
+
+        return "\(oidnPipelineTitle) waiting@\(targetFrame)spp"
+    }
+
+    private var oidnPipelineTitle: String {
+        oidnUseAuxiliaryInputs ? "OIDN" : "OIDN(color)"
+    }
+
+    private var oidnJobElapsedTime: CFTimeInterval? {
+        guard let oidnJobStartTime else {
+            return nil
+        }
+        return CACurrentMediaTime() - oidnJobStartTime
+    }
+
     var windowTitle: String {
-        "RT Path Tracer | \(sceneTitleLabel) | p\(camera.compactPositionString) | v\(camera.compactViewString) | \(renderModeTitle) \(renderModeDetailCompact)"
+        var components = [
+            "RT Path Tracer",
+            sceneTitleLabel,
+            "p\(camera.compactPositionString)",
+            "v\(camera.compactViewString)",
+            "\(renderModeTitle) \(renderModeDetailCompact)"
+        ]
+        if let oidnStatusTitle {
+            components.append(oidnStatusTitle)
+        }
+        return components.joined(separator: " | ")
     }
 
     func cycleRenderMode() {
@@ -200,6 +266,7 @@ class Renderer {
             ? DenoiseMethod.allCases[0]
             : DenoiseMethod.allCases[nextIndex]
         selectedDenoiseMethod = nextMethod
+        resetOIDNRuntimeConfiguration()
 
         if selectedRenderMode == .accumulation || activeRenderMode == .accumulation {
             resetTemporalState(syncCameraHistory: true)
@@ -364,6 +431,7 @@ class Renderer {
         let exposureDeltaTime = min(max(Float(now - lastExposureUpdateTime), 1.0 / 240.0), 0.25)
         lastExposureUpdateTime = now
         updateExposure(deltaTime: exposureDeltaTime)
+        recoverFromStalledOIDNJob(now: now)
 
         let requestedRenderMode = preferredRenderMode(isMoving: isMoving)
         let wantsMetalFX = (requestedRenderMode == .metalfx || requestedRenderMode == .metalfxSVGF) && upscaler?.supportsMetalFX == true
@@ -379,6 +447,7 @@ class Renderer {
             previousJitter = jitter
             accumulationCount = 0
             upscaler?.reset()
+            resetOIDNState()
         }
 
         upscaler?.configure(inputWidth: renderW,
@@ -437,6 +506,13 @@ class Renderer {
             accumulationCount = 0
         }
 
+        if effectiveRenderMode == .accumulation,
+           selectedDenoiseMethod == .oidn,
+           !isMoving,
+           shouldResetOIDNForAccumulationRestart(stoppedMoving: stoppedMoving) {
+            resetOIDNState()
+        }
+
         // ── Build uniforms ──
         let pos = camera.position
         let right = camera.rightVector
@@ -491,6 +567,7 @@ class Renderer {
             && selectedDenoiseMethod == .oidn
             && !isMoving
             && oidnDenoiser.isAvailable
+            && oidnRuntimeDisabledReason == nil
 
         if selectedDenoiseMethod == .oidn && !oidnDenoiser.isAvailable {
             logOIDNAvailabilityIfNeeded()
@@ -828,19 +905,22 @@ class Renderer {
         }
 
         let shouldScheduleOIDN = shouldScheduleOIDNDenoise(for: accumulationCount)
+        let includeAuxiliaryInputs = oidnUseAuxiliaryInputs
         let stagedColorTexture = shouldScheduleOIDN
             ? stageSharedTextureSnapshot(from: accumulationTexture, commandBuffer: commandBuffer)
             : nil
-        let stagedAlbedoTexture = shouldScheduleOIDN
+        let stagedAlbedoTexture = shouldScheduleOIDN && includeAuxiliaryInputs
             ? pathTracer.albedoTexture.flatMap { stageSharedTextureSnapshot(from: $0, commandBuffer: commandBuffer) }
             : nil
-        let stagedNormalTexture = shouldScheduleOIDN
+        let stagedNormalTexture = shouldScheduleOIDN && includeAuxiliaryInputs
             ? pathTracer.normalTexture.flatMap { stageSharedTextureSnapshot(from: $0, commandBuffer: commandBuffer) }
             : nil
         let scheduledOIDNFrame = accumulationCount
 
         if stagedColorTexture != nil {
             oidnJobInFlight = true
+            oidnJobStartTime = CACurrentMediaTime()
+            logOIDNEvent("schedule accumulationFrame=\(scheduledOIDNFrame) generation=\(oidnGeneration)")
         }
 
         let presentationSource = currentOIDNPresentationTexture() ?? accumulationTexture
@@ -862,7 +942,8 @@ class Renderer {
                                                  albedoTexture: stagedAlbedoTexture,
                                                  normalTexture: stagedNormalTexture,
                                                                                                  accumulationFrame: scheduledOIDNFrame,
-                                                 generation: self.oidnGeneration)
+                                                 generation: self.oidnGeneration,
+                                                 usedAuxiliaryInputs: includeAuxiliaryInputs)
                     })
     }
 
@@ -1071,6 +1152,20 @@ class Renderer {
         return accumulationFrame <= 4 || accumulationFrame.isMultiple(of: 4)
     }
 
+    private func shouldResetOIDNForAccumulationRestart(stoppedMoving: Bool) -> Bool {
+        guard accumulationCount <= 1 else {
+            return false
+        }
+
+        if stoppedMoving {
+            return true
+        }
+
+        return oidnLatestFrame >= accumulationCount
+            || oidnLatestTexture != nil
+            || oidnJobInFlight
+    }
+
     private func currentOIDNPresentationTexture() -> MTLTexture? {
         guard let oidnLatestTexture,
               let accumulationTexture = pathTracer.accumulatedTexture,
@@ -1086,7 +1181,8 @@ class Renderer {
                                      albedoTexture: MTLTexture?,
                                      normalTexture: MTLTexture?,
                                      accumulationFrame: UInt32,
-                                     generation: UInt64) {
+                                     generation: UInt64,
+                                     usedAuxiliaryInputs: Bool) {
         oidnQueue.async { [weak self] in
             guard let self else {
                 return
@@ -1117,6 +1213,8 @@ class Renderer {
             DispatchQueue.main.async {
                 guard generation == self.oidnGeneration,
                       self.selectedDenoiseMethod == .oidn else {
+                    self.logOIDNEvent("discard accumulationFrame=\(accumulationFrame) generation=\(generation) currentGeneration=\(self.oidnGeneration)")
+                                        self.oidnJobStartTime = nil
                     self.oidnJobInFlight = false
                     return
                 }
@@ -1124,10 +1222,49 @@ class Renderer {
                 if let filteredTexture {
                     self.oidnLatestTexture = filteredTexture
                     self.oidnLatestFrame = accumulationFrame
+                    self.oidnRuntimeDisabledReason = nil
+                    self.oidnUseAuxiliaryInputs = usedAuxiliaryInputs
+                    self.logOIDNEvent("complete accumulationFrame=\(accumulationFrame) generation=\(generation)")
+                } else {
+                    self.logOIDNEvent("failed accumulationFrame=\(accumulationFrame) generation=\(generation)")
                 }
+                self.oidnJobStartTime = nil
                 self.oidnJobInFlight = false
             }
         }
+    }
+
+    private func recoverFromStalledOIDNJob(now: CFTimeInterval) {
+        guard oidnJobInFlight,
+              let oidnJobStartTime,
+              now - oidnJobStartTime >= oidnJobTimeout else {
+            return
+        }
+
+        let elapsed = now - oidnJobStartTime
+        if oidnUseAuxiliaryInputs {
+            logOIDNEvent("watchdog fallback to color-only after \(String(format: "%.2f", elapsed))s generation=\(oidnGeneration)")
+            oidnRuntimeDisabledReason = nil
+            oidnUseAuxiliaryInputs = false
+            resetOIDNState()
+            return
+        }
+
+        logOIDNEvent("watchdog disabled OIDN after \(String(format: "%.2f", elapsed))s generation=\(oidnGeneration)")
+        oidnRuntimeDisabledReason = "OIDN timed out"
+        resetOIDNState()
+    }
+
+    private func resetOIDNRuntimeConfiguration() {
+        oidnUseAuxiliaryInputs = true
+        oidnRuntimeDisabledReason = nil
+    }
+
+    private func logOIDNEvent(_ message: String) {
+        guard shouldLogOIDNEvents else {
+            return
+        }
+        print("[OIDN] \(message)")
     }
 
     private func updateExposure(deltaTime: Float) {
@@ -1175,10 +1312,15 @@ class Renderer {
     }
 
     private func resetOIDNState() {
+        let hadState = oidnLatestTexture != nil || oidnLatestFrame > 0 || oidnJobInFlight
         oidnGeneration += 1
         oidnLatestTexture = nil
         oidnLatestFrame = 0
+        oidnJobStartTime = nil
         oidnJobInFlight = false
+        if hadState {
+            logOIDNEvent("reset generation=\(oidnGeneration)")
+        }
     }
 
     private func resetExposureState() {

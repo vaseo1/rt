@@ -184,19 +184,11 @@ final class OIDNDenoiser {
             return nil
         }
 
-        var colorRGB = [Float](repeating: 0, count: pixelCount * 3)
+        var colorRGB = Self.makeSanitizedColorRGB(from: colorRGBA, pixelCount: pixelCount)
         var outputRGB = [Float](repeating: 0, count: pixelCount * 3)
-        var albedoRGB = albedoRGBA.flatMap { Self.convertRGBAtoRGB($0, pixelCount: pixelCount) }
-        var normalRGB = normalRGBA.flatMap { Self.convertRGBAtoRGB($0, pixelCount: pixelCount) }
-        let inputScale = Self.computeInputScale(colorRGBAPixels: colorRGBA, pixelCount: pixelCount)
-
-        for pixelIndex in 0..<pixelCount {
-            let rgbaIndex = pixelIndex * 4
-            let rgbIndex = pixelIndex * 3
-            colorRGB[rgbIndex] = colorRGBA[rgbaIndex]
-            colorRGB[rgbIndex + 1] = colorRGBA[rgbaIndex + 1]
-            colorRGB[rgbIndex + 2] = colorRGBA[rgbaIndex + 2]
-        }
+        var albedoRGB = albedoRGBA.flatMap { Self.makeSanitizedAlbedoRGB(from: $0, pixelCount: pixelCount) }
+        var normalRGB = normalRGBA.flatMap { Self.makeSanitizedNormalRGB(from: $0, pixelCount: pixelCount) }
+        let inputScale = Self.computeInputScale(colorRGBPixels: colorRGB)
 
         guard let filter = "RT".withCString({ api.newFilter(device, $0) }) else {
             return nil
@@ -306,9 +298,9 @@ final class OIDNDenoiser {
         for pixelIndex in 0..<pixelCount {
             let rgbaIndex = pixelIndex * 4
             let rgbIndex = pixelIndex * 3
-            outputRGBA[rgbaIndex] = outputRGB[rgbIndex]
-            outputRGBA[rgbaIndex + 1] = outputRGB[rgbIndex + 1]
-            outputRGBA[rgbaIndex + 2] = outputRGB[rgbIndex + 2]
+            outputRGBA[rgbaIndex] = Self.sanitizeHDRComponent(outputRGB[rgbIndex])
+            outputRGBA[rgbaIndex + 1] = Self.sanitizeHDRComponent(outputRGB[rgbIndex + 1])
+            outputRGBA[rgbaIndex + 2] = Self.sanitizeHDRComponent(outputRGB[rgbIndex + 2])
             outputRGBA[rgbaIndex + 3] = colorRGBA[rgbaIndex + 3]
         }
 
@@ -328,7 +320,19 @@ final class OIDNDenoiser {
         return "OIDN reported error code \(errorCode.rawValue)."
     }
 
-    private static func convertRGBAtoRGB(_ rgbaPixels: [Float], pixelCount: Int) -> [Float]? {
+    private static func makeSanitizedColorRGB(from rgbaPixels: [Float], pixelCount: Int) -> [Float] {
+        var rgbPixels = [Float](repeating: 0, count: pixelCount * 3)
+        for pixelIndex in 0..<pixelCount {
+            let rgbaIndex = pixelIndex * 4
+            let rgbIndex = pixelIndex * 3
+            rgbPixels[rgbIndex] = sanitizeHDRComponent(rgbaPixels[rgbaIndex])
+            rgbPixels[rgbIndex + 1] = sanitizeHDRComponent(rgbaPixels[rgbaIndex + 1])
+            rgbPixels[rgbIndex + 2] = sanitizeHDRComponent(rgbaPixels[rgbaIndex + 2])
+        }
+        return rgbPixels
+    }
+
+    private static func makeSanitizedAlbedoRGB(from rgbaPixels: [Float], pixelCount: Int) -> [Float]? {
         guard rgbaPixels.count == pixelCount * 4 else {
             return nil
         }
@@ -337,22 +341,48 @@ final class OIDNDenoiser {
         for pixelIndex in 0..<pixelCount {
             let rgbaIndex = pixelIndex * 4
             let rgbIndex = pixelIndex * 3
-            rgbPixels[rgbIndex] = rgbaPixels[rgbaIndex]
-            rgbPixels[rgbIndex + 1] = rgbaPixels[rgbaIndex + 1]
-            rgbPixels[rgbIndex + 2] = rgbaPixels[rgbaIndex + 2]
+            rgbPixels[rgbIndex] = sanitizeUnitIntervalComponent(rgbaPixels[rgbaIndex])
+            rgbPixels[rgbIndex + 1] = sanitizeUnitIntervalComponent(rgbaPixels[rgbaIndex + 1])
+            rgbPixels[rgbIndex + 2] = sanitizeUnitIntervalComponent(rgbaPixels[rgbaIndex + 2])
         }
         return rgbPixels
     }
 
-    private static func computeInputScale(colorRGBAPixels: [Float], pixelCount: Int) -> Float {
+    private static func makeSanitizedNormalRGB(from rgbaPixels: [Float], pixelCount: Int) -> [Float]? {
+        guard rgbaPixels.count == pixelCount * 4 else {
+            return nil
+        }
+
+        var rgbPixels = [Float](repeating: 0, count: pixelCount * 3)
+        for pixelIndex in 0..<pixelCount {
+            let rgbaIndex = pixelIndex * 4
+            let rgbIndex = pixelIndex * 3
+            let x = sanitizeSignedUnitComponent(rgbaPixels[rgbaIndex])
+            let y = sanitizeSignedUnitComponent(rgbaPixels[rgbaIndex + 1])
+            let z = sanitizeSignedUnitComponent(rgbaPixels[rgbaIndex + 2])
+            let lengthSquared = x * x + y * y + z * z
+            if lengthSquared > 1e-8 {
+                let inverseLength = 1 / sqrt(lengthSquared)
+                rgbPixels[rgbIndex] = x * inverseLength
+                rgbPixels[rgbIndex + 1] = y * inverseLength
+                rgbPixels[rgbIndex + 2] = z * inverseLength
+            } else {
+                rgbPixels[rgbIndex] = 0
+                rgbPixels[rgbIndex + 1] = 1
+                rgbPixels[rgbIndex + 2] = 0
+            }
+        }
+        return rgbPixels
+    }
+
+    private static func computeInputScale(colorRGBPixels: [Float]) -> Float {
         var luminanceSum: Double = 0
         var validCount = 0
 
-        for pixelIndex in 0..<pixelCount {
-            let rgbaIndex = pixelIndex * 4
-            let r = colorRGBAPixels[rgbaIndex]
-            let g = colorRGBAPixels[rgbaIndex + 1]
-            let b = colorRGBAPixels[rgbaIndex + 2]
+        for pixelIndex in stride(from: 0, to: colorRGBPixels.count, by: 3) {
+            let r = colorRGBPixels[pixelIndex]
+            let g = colorRGBPixels[pixelIndex + 1]
+            let b = colorRGBPixels[pixelIndex + 2]
             let luminance = max(0.2126 * r + 0.7152 * g + 0.0722 * b, 0)
             if luminance.isFinite && luminance > 0 {
                 luminanceSum += Double(luminance)
@@ -362,5 +392,26 @@ final class OIDNDenoiser {
 
         let averageLuminance = validCount > 0 ? Float(luminanceSum / Double(validCount)) : 1
         return 1 / max(averageLuminance, 1e-3)
+    }
+
+    private static func sanitizeHDRComponent(_ value: Float) -> Float {
+        guard value.isFinite else {
+            return 0
+        }
+        return min(max(value, 0), 1e4)
+    }
+
+    private static func sanitizeUnitIntervalComponent(_ value: Float) -> Float {
+        guard value.isFinite else {
+            return 0
+        }
+        return min(max(value, 0), 1)
+    }
+
+    private static func sanitizeSignedUnitComponent(_ value: Float) -> Float {
+        guard value.isFinite else {
+            return 0
+        }
+        return min(max(value, -1), 1)
     }
 }

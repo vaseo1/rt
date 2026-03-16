@@ -76,6 +76,7 @@ struct LaunchConfig {
     var highlightWater = false
     var renderMode: RenderMode = .accumulation
     var denoiseMethod: DenoiseMethod = .none
+    var scriptedOIDNRepro = false
 }
 
 private func failArgumentParsing(_ message: String) -> Never {
@@ -195,6 +196,8 @@ func parseLaunchArgs() -> LaunchConfig {
             config.lookAtWater = true
         case "--highlight-water":
             config.highlightWater = true
+        case "--scripted-oidn-repro":
+            config.scriptedOIDNRepro = true
         case "--render-mode":
             guard index + 1 < args.count,
                   let renderMode = RenderMode(rawValue: args[index + 1].lowercased()) else {
