@@ -28,6 +28,7 @@ class Renderer {
     private var accelBuilder: AccelStructureBuilder
     private var scene: SceneGeometry
     private var upscaler: MetalFXUpscaler?
+    private let oidnDenoiser = OIDNDenoiser()
     private(set) var sceneTitleLabel: String = "test"
     private let startupCameraPosition: SIMD3<Float>
     private let startupCameraYaw: Float
@@ -66,6 +67,24 @@ class Renderer {
     private var completedFrames: UInt32 = 0
     private var previousCameraMoving = false
     private var previousJitter = SIMD2<Float>(repeating: 0)
+    private let verifyCheckpointFrames: [UInt32]
+    private let verifySweepMethods: [DenoiseMethod]
+    private let verifyReferenceFrame: UInt32?
+    private let verifyReferenceDenoiseMethod: DenoiseMethod
+    private var verifyCheckpointIndex = 0
+    private var verifySweepIndex = 0
+    private var verifyAllPassed = true
+    private var verifyReferencePixels: [UInt8]?
+    private var verifyReferenceHDRPixels: [Float]?
+    private var verifyReferenceLabel: String?
+    private var verifyReferenceReady = false
+    private var verifyReferenceTransitionPending = false
+    private let oidnQueue = DispatchQueue(label: "dev.rt.oidn", qos: .userInitiated)
+    private var oidnLatestTexture: MTLTexture?
+    private var oidnLatestFrame: UInt32 = 0
+    private var oidnJobInFlight = false
+    private var oidnGeneration: UInt64 = 0
+    private var hasLoggedOIDNAvailability = false
 
     init(device: MTLDevice, view: GameView, launchConfig: LaunchConfig) {
         self.device = device
@@ -73,7 +92,22 @@ class Renderer {
         self.verifyConfig = launchConfig.verifyConfig
         self.selectedRenderMode = launchConfig.renderMode
         self.activeRenderMode = launchConfig.renderMode
-        self.selectedDenoiseMethod = launchConfig.denoiseMethod
+        let shouldSweepDenoise = launchConfig.verifyConfig.enabled
+            && launchConfig.verifyConfig.sweepDenoiseMethods
+            && launchConfig.renderMode == .accumulation
+
+        let checkpointFrames = Array(Set(launchConfig.verifyConfig.checkpointFrames.filter { $0 > 0 })).sorted()
+        self.verifyCheckpointFrames = checkpointFrames.isEmpty
+            ? [max(launchConfig.verifyConfig.targetFrames, 1)]
+            : checkpointFrames
+        self.verifySweepMethods = shouldSweepDenoise ? DenoiseMethod.allCases : [launchConfig.denoiseMethod]
+        self.verifyReferenceFrame = launchConfig.verifyConfig.referenceFrames
+        self.verifyReferenceDenoiseMethod = launchConfig.verifyConfig.referenceDenoiseMethod
+        self.selectedDenoiseMethod = launchConfig.verifyConfig.referenceFrames != nil
+            ? launchConfig.verifyConfig.referenceDenoiseMethod
+            : (shouldSweepDenoise
+                ? (self.verifySweepMethods.first ?? launchConfig.denoiseMethod)
+                : launchConfig.denoiseMethod)
         self.startupCameraPosition = launchConfig.startPosition ?? Self.defaultStartupCameraPosition
         self.startupCameraYaw = Self.defaultStartupCameraYawDegrees * .pi / 180.0
         self.startupCameraPitch = Self.defaultStartupCameraPitchDegrees * .pi / 180.0
@@ -111,7 +145,11 @@ class Renderer {
         case .raw:
             return "1 spp"
         case .accumulation:
-            return "\(max(accumulationCount, 1)) spp"
+            let base = "\(max(accumulationCount, 1)) spp"
+            if selectedDenoiseMethod != .none {
+                return "\(base) + \(selectedDenoiseMethod.displayName)"
+            }
+            return base
         case .svgf, .metalfx, .metalfxSVGF:
             return "\(max(accumulationCount, 1)) history"
         case .auto:
@@ -158,10 +196,16 @@ class Renderer {
         }
 
         let nextIndex = DenoiseMethod.allCases.index(after: currentIndex)
-        selectedDenoiseMethod = nextIndex == DenoiseMethod.allCases.endIndex
+        let nextMethod = nextIndex == DenoiseMethod.allCases.endIndex
             ? DenoiseMethod.allCases[0]
             : DenoiseMethod.allCases[nextIndex]
-        print("[Renderer] Denoise method: \(selectedDenoiseMethod.displayName)")
+        selectedDenoiseMethod = nextMethod
+
+        if selectedRenderMode == .accumulation || activeRenderMode == .accumulation {
+            resetTemporalState(syncCameraHistory: true)
+        }
+
+        print("[Renderer] Accumulation denoiser: \(selectedDenoiseMethod.displayName)")
     }
 
     // MARK: - Scene Loading
@@ -351,6 +395,9 @@ class Renderer {
             accumulationCount = 0
         case .accumulation:
             if isMoving {
+                if selectedDenoiseMethod == .oidn {
+                    resetOIDNState()
+                }
                 accumulationCount = 0
             } else {
                 accumulationCount += 1
@@ -433,8 +480,6 @@ class Renderer {
             exposurePadding2: 0
         )
 
-        // ── Encode ──
-        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
         submittedFrames += 1
         let submittedFrame = submittedFrames
         let submitTime = CACurrentMediaTime()
@@ -442,15 +487,53 @@ class Renderer {
             print("[Renderer] Submit frame #\(submittedFrame) accumulation=\(accumulationCount) render=\(renderW)x\(renderH) output=\(outputWidth)x\(outputHeight) moving=\(camera.isMoving)")
         }
 
+        let canUseOIDN = effectiveRenderMode == .accumulation
+            && selectedDenoiseMethod == .oidn
+            && !isMoving
+            && oidnDenoiser.isAvailable
+
+        if selectedDenoiseMethod == .oidn && !oidnDenoiser.isAvailable {
+            logOIDNAvailabilityIfNeeded()
+        }
+
+        if canUseOIDN {
+            if verifyConfig.enabled {
+                renderAccumulationWithOIDN(drawable: drawable,
+                                           uniforms: &uniforms,
+                                           accelStructure: accelStructure,
+                                           scene: scene,
+                                           submittedFrame: submittedFrame,
+                                           submitTime: submitTime,
+                                           onComplete: onComplete)
+            } else {
+                renderAccumulationWithOIDNAsync(drawable: drawable,
+                                                uniforms: &uniforms,
+                                                accelStructure: accelStructure,
+                                                scene: scene,
+                                                submittedFrame: submittedFrame,
+                                                submitTime: submitTime,
+                                                onComplete: onComplete)
+            }
+            previousCameraMoving = isMoving
+            previousJitter = jitter
+            frameIndex += 1
+            return
+        }
+
+        // ── Encode ──
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else { return }
+
         pathTracer.encodePathTrace(commandBuffer: commandBuffer,
                                    uniforms: &uniforms,
                                    accelStructure: accelStructure,
                                    scene: scene)
 
         let hdrSource: MTLTexture?
+        let exposureSource: MTLTexture?
         switch effectiveRenderMode {
         case .raw:
             hdrSource = pathTracer.colorTexture
+            exposureSource = hdrSource
         case .accumulation:
             if selectedDenoiseMethod != .none {
                 pathTracer.encodeClampedAccumulation(commandBuffer: commandBuffer,
@@ -460,8 +543,16 @@ class Renderer {
                                               uniforms: &uniforms)
             }
             pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
+            exposureSource = pathTracer.accumulatedTexture
             if selectedDenoiseMethod != .none, let accumTex = pathTracer.accumulatedTexture {
                 switch selectedDenoiseMethod {
+                case .svgfPlus:
+                    hdrSource = pathTracer.encodeAccumulationSVGFPlus(
+                        commandBuffer: commandBuffer,
+                        uniforms: &uniforms,
+                        sourceTexture: accumTex) ?? accumTex
+                case .oidn:
+                    hdrSource = accumTex
                 case .eaw:
                     hdrSource = pathTracer.encodePostATrous(
                         commandBuffer: commandBuffer,
@@ -486,6 +577,7 @@ class Renderer {
         case .svgf:
             hdrSource = pathTracer.encodeSVGF(commandBuffer: commandBuffer,
                                               uniforms: &uniforms) ?? pathTracer.colorTexture
+            exposureSource = hdrSource
         case .metalfx:
             if let upscaler,
                let colorTexture = pathTracer.colorTexture,
@@ -508,8 +600,10 @@ class Renderer {
                                 jitterX: jitter.x,
                                 jitterY: jitter.y)
                 hdrSource = upscaler.outputTexture ?? metalFXInput
+                exposureSource = metalFXInput
             } else {
                 hdrSource = pathTracer.colorTexture
+                exposureSource = hdrSource
             }
         case .metalfxSVGF:
             if let upscaler,
@@ -537,91 +631,26 @@ class Renderer {
                                 jitterX: jitter.x,
                                 jitterY: jitter.y)
                 hdrSource = upscaler.outputTexture ?? metalFXInput
+                exposureSource = metalFXInput
             } else {
                 hdrSource = pathTracer.colorTexture
+                exposureSource = hdrSource
             }
         case .auto:
             hdrSource = pathTracer.colorTexture
-        }
-
-        let hasExposureMeasurement = hdrSource != nil
-        if let hdrSource {
-            pathTracer.encodeExposureMeasurement(commandBuffer: commandBuffer,
-                                                sourceTexture: hdrSource)
-            let tonemapSource = pathTracer.encodeBloom(commandBuffer: commandBuffer,
-                                                       sourceTexture: hdrSource) ?? hdrSource
-            pathTracer.encodeTonemap(commandBuffer: commandBuffer,
-                                     uniforms: &uniforms,
-                                     sourceTexture: tonemapSource)
+            exposureSource = hdrSource
         }
         previousCameraMoving = isMoving
         previousJitter = jitter
 
-        // ── Present ──
-        guard let tonemapped = pathTracer.tonemappedTexture else { return }
-
-        // Blit tonemapped result to drawable
-        if let blit = commandBuffer.makeBlitCommandEncoder() {
-            let drawableTexture = drawable.texture
-            let srcSize = MTLSize(width: min(tonemapped.width, drawableTexture.width),
-                                  height: min(tonemapped.height, drawableTexture.height),
-                                  depth: 1)
-            blit.copy(from: tonemapped,
-                      sourceSlice: 0, sourceLevel: 0,
-                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
-                      sourceSize: srcSize,
-                      to: drawableTexture,
-                      destinationSlice: 0, destinationLevel: 0,
-                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
-            blit.endEncoding()
-        }
-
-        commandBuffer.present(drawable)
-
-        // Capture screenshot/verify state before the completed handler
-        let needsVerify = verifyConfig.enabled && !verifyCompleted && accumulationCount >= verifyConfig.targetFrames
-        let needsScreenshot = pendingScreenshot
-        if needsVerify { verifyCompleted = true }
-        if needsScreenshot { pendingScreenshot = false }
-        if needsVerify || needsScreenshot { captureInProgress = true }
-
-        commandBuffer.addCompletedHandler { [weak self] buffer in
-            // Screenshot / verify capture (GPU work is done, off main thread)
-            if let self = self {
-                if hasExposureMeasurement {
-                    let measuredAverageLuminance = self.pathTracer.readMeasuredAverageLuminance()
-                    DispatchQueue.main.async {
-                        self.measuredAverageLuminance = measuredAverageLuminance
-                    }
-                }
-
-                self.completedFrames += 1
-                let elapsedMs = (CACurrentMediaTime() - submitTime) * 1000.0
-                if self.verifyConfig.enabled && submittedFrame <= 8 {
-                    let errorText = buffer.error.map { String(describing: $0) } ?? "none"
-                    print(String(format: "[Renderer] Complete frame #%u status=%@ elapsed=%.1fms error=%@ accumulation=%u",
-                                 submittedFrame,
-                                 self.debugDescription(for: buffer.status),
-                                 elapsedMs,
-                                 errorText,
-                                 self.accumulationCount))
-                }
-
-                if let tex = self.pathTracer.tonemappedTexture {
-                    if needsVerify {
-                        self.performVerifyCapture(texture: tex)
-                    } else if needsScreenshot {
-                        self.performInteractiveScreenshot(texture: tex)
-                        DispatchQueue.main.async {
-                            self.captureInProgress = false
-                        }
-                    }
-                }
-            }
-            onComplete?()
-        }
-
-        commandBuffer.commit()
+        submitFrame(commandBuffer: commandBuffer,
+                    drawable: drawable,
+                    uniforms: &uniforms,
+                    hdrSource: hdrSource,
+                    exposureSource: exposureSource,
+                    submittedFrame: submittedFrame,
+                    submitTime: submitTime,
+                    onComplete: onComplete)
 
         frameIndex += 1
     }
@@ -634,22 +663,54 @@ class Renderer {
 
     // MARK: - Screenshot & Verification
 
-    private func performVerifyCapture(texture: MTLTexture) {
-        let url = URL(fileURLWithPath: verifyConfig.outputPath)
+    private func performVerifyCapture(texture: MTLTexture, hdrTexture: MTLTexture?, capturedFrame: UInt32) {
+        let isReferenceCapture = isCapturingReference()
+        let url = verifyOutputURL(capturedFrame: capturedFrame)
         let saved = ScreenshotCapture.capture(texture: texture, commandQueue: commandQueue, to: url)
         let metrics = ScreenshotCapture.computeMetrics(texture: texture, commandQueue: commandQueue)
+        print("[VERIFY] capture frame=\(capturedFrame) render=\(selectedRenderMode.rawValue) denoise=\(selectedDenoiseMethod.rawValue)")
+        if isReferenceCapture {
+            print("[VERIFY] capture_role: reference")
+        }
         metrics.printReport(screenshotPath: saved ? url.path : nil)
+        if isReferenceCapture {
+            verifyReferencePixels = ScreenshotCapture.readRGBA8Pixels(texture: texture, commandQueue: commandQueue)
+            verifyReferenceHDRPixels = hdrTexture.flatMap {
+                ScreenshotCapture.readRGBA32FloatPixels(texture: $0, commandQueue: commandQueue)
+            }
+            verifyReferenceLabel = url.lastPathComponent
+            if verifyReferencePixels == nil {
+                print("[VERIFY] ERROR: Failed to read reference pixels")
+                verifyReferenceReady = false
+                verifyReferenceTransitionPending = false
+            } else {
+                verifyReferenceReady = true
+                verifyReferenceTransitionPending = true
+            }
+        } else if let hdrTexture,
+                  let referenceHDRPixels = verifyReferenceHDRPixels,
+                  let referenceLabel = verifyReferenceLabel,
+                  let hdrReferenceMetrics = ScreenshotCapture.computeHDRReferenceMetrics(texture: hdrTexture,
+                                                                                        commandQueue: commandQueue,
+                                                                                        referencePixels: referenceHDRPixels) {
+            hdrReferenceMetrics.printReport(referenceLabel: referenceLabel)
+        } else if let referencePixels = verifyReferencePixels,
+                  let referenceLabel = verifyReferenceLabel,
+                  let referenceMetrics = ScreenshotCapture.computeReferenceMetrics(texture: texture,
+                                                                                  commandQueue: commandQueue,
+                                                                                  referencePixels: referencePixels) {
+            referenceMetrics.printReport(referenceLabel: referenceLabel)
+        }
         if highlightWater {
             let magentaCoverage = ScreenshotCapture.computeMagentaCoverage(texture: texture,
                                                                            commandQueue: commandQueue)
             print(String(format: "[VERIFY] magenta_pct: %.2f", magentaCoverage))
         }
 
-        // Exit with appropriate code
-        let exitCode: Int32 = metrics.passed ? 0 : 1
         DispatchQueue.main.async {
-            NSApplication.shared.reply(toApplicationShouldTerminate: true)
-            exit(exitCode)
+            let referenceReadSucceeded = !isReferenceCapture || self.verifyReferencePixels != nil
+            self.verifyAllPassed = self.verifyAllPassed && saved && metrics.passed && referenceReadSucceeded
+            self.advanceVerifyState()
         }
     }
 
@@ -678,6 +739,394 @@ class Renderer {
         case .completed: return "completed"
         case .error: return "error"
         @unknown default: return "unknown"
+        }
+    }
+
+    private func renderAccumulationWithOIDN(drawable: CAMetalDrawable,
+                                            uniforms: inout Uniforms,
+                                            accelStructure: MTLAccelerationStructure,
+                                            scene: SceneGeometry,
+                                            submittedFrame: UInt32,
+                                            submitTime: CFTimeInterval,
+                                            onComplete: (() -> Void)?) {
+        guard let accumulationCommandBuffer = commandQueue.makeCommandBuffer() else {
+            onComplete?()
+            return
+        }
+
+        pathTracer.encodePathTrace(commandBuffer: accumulationCommandBuffer,
+                                   uniforms: &uniforms,
+                                   accelStructure: accelStructure,
+                                   scene: scene)
+        pathTracer.encodeClampedAccumulation(commandBuffer: accumulationCommandBuffer,
+                                             uniforms: &uniforms)
+        pathTracer.copyAccumulationToHistory(commandBuffer: accumulationCommandBuffer)
+        if let accumulationTexture = pathTracer.accumulatedTexture {
+            pathTracer.encodeExposureMeasurement(commandBuffer: accumulationCommandBuffer,
+                                                sourceTexture: accumulationTexture)
+        }
+
+        accumulationCommandBuffer.commit()
+        accumulationCommandBuffer.waitUntilCompleted()
+
+        if accumulationCommandBuffer.status == .error {
+            let errorText = accumulationCommandBuffer.error.map { String(describing: $0) } ?? "unknown"
+            print("[Renderer] OIDN accumulation pass failed: \(errorText)")
+            onComplete?()
+            return
+        }
+
+        let measuredAverageLuminance = pathTracer.readMeasuredAverageLuminance()
+        DispatchQueue.main.async {
+            self.measuredAverageLuminance = measuredAverageLuminance
+        }
+
+        guard let accumulationTexture = pathTracer.accumulatedTexture else {
+            onComplete?()
+            return
+        }
+
+        let hdrSource = prepareOIDNTexture(from: accumulationTexture) ?? accumulationTexture
+        guard let presentationCommandBuffer = commandQueue.makeCommandBuffer() else {
+            onComplete?()
+            return
+        }
+
+        submitFrame(commandBuffer: presentationCommandBuffer,
+                    drawable: drawable,
+                    uniforms: &uniforms,
+                    hdrSource: hdrSource,
+                    exposureSource: nil,
+                    submittedFrame: submittedFrame,
+                    submitTime: submitTime,
+                    onComplete: onComplete)
+    }
+
+    private func renderAccumulationWithOIDNAsync(drawable: CAMetalDrawable,
+                                                 uniforms: inout Uniforms,
+                                                 accelStructure: MTLAccelerationStructure,
+                                                 scene: SceneGeometry,
+                                                 submittedFrame: UInt32,
+                                                 submitTime: CFTimeInterval,
+                                                 onComplete: (() -> Void)?) {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            onComplete?()
+            return
+        }
+
+        pathTracer.encodePathTrace(commandBuffer: commandBuffer,
+                                   uniforms: &uniforms,
+                                   accelStructure: accelStructure,
+                                   scene: scene)
+        pathTracer.encodeClampedAccumulation(commandBuffer: commandBuffer,
+                                             uniforms: &uniforms)
+        pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
+
+        guard let accumulationTexture = pathTracer.accumulatedTexture else {
+            onComplete?()
+            return
+        }
+
+        let shouldScheduleOIDN = shouldScheduleOIDNDenoise(for: accumulationCount)
+        let stagedColorTexture = shouldScheduleOIDN
+            ? stageSharedTextureSnapshot(from: accumulationTexture, commandBuffer: commandBuffer)
+            : nil
+        let stagedAlbedoTexture = shouldScheduleOIDN
+            ? pathTracer.albedoTexture.flatMap { stageSharedTextureSnapshot(from: $0, commandBuffer: commandBuffer) }
+            : nil
+        let stagedNormalTexture = shouldScheduleOIDN
+            ? pathTracer.normalTexture.flatMap { stageSharedTextureSnapshot(from: $0, commandBuffer: commandBuffer) }
+            : nil
+        let scheduledOIDNFrame = accumulationCount
+
+        if stagedColorTexture != nil {
+            oidnJobInFlight = true
+        }
+
+        let presentationSource = currentOIDNPresentationTexture() ?? accumulationTexture
+
+        submitFrame(commandBuffer: commandBuffer,
+                    drawable: drawable,
+                    uniforms: &uniforms,
+                    hdrSource: presentationSource,
+                    exposureSource: accumulationTexture,
+                    submittedFrame: submittedFrame,
+                    submitTime: submitTime,
+                    onComplete: onComplete,
+                    postCompletion: { [weak self] in
+                        guard let self,
+                              let stagedColorTexture else {
+                            return
+                        }
+                        self.scheduleOIDNDenoise(colorTexture: stagedColorTexture,
+                                                 albedoTexture: stagedAlbedoTexture,
+                                                 normalTexture: stagedNormalTexture,
+                                                                                                 accumulationFrame: scheduledOIDNFrame,
+                                                 generation: self.oidnGeneration)
+                    })
+    }
+
+    private func submitFrame(commandBuffer: MTLCommandBuffer,
+                             drawable: CAMetalDrawable,
+                             uniforms: inout Uniforms,
+                             hdrSource: MTLTexture?,
+                             exposureSource: MTLTexture?,
+                             submittedFrame: UInt32,
+                             submitTime: CFTimeInterval,
+                             onComplete: (() -> Void)?,
+                             postCompletion: (() -> Void)? = nil) {
+        let hasExposureMeasurement = exposureSource != nil
+        if let exposureSource {
+            pathTracer.encodeExposureMeasurement(commandBuffer: commandBuffer,
+                                                sourceTexture: exposureSource)
+        }
+        if let hdrSource {
+            let tonemapSource = pathTracer.encodeBloom(commandBuffer: commandBuffer,
+                                                       sourceTexture: hdrSource) ?? hdrSource
+            pathTracer.encodeTonemap(commandBuffer: commandBuffer,
+                                     uniforms: &uniforms,
+                                     sourceTexture: tonemapSource)
+        }
+
+        let verifyTargetFrame = currentVerifyTargetFrame()
+        let needsVerify = verifyConfig.enabled
+            && !verifyCompleted
+            && verifyTargetFrame != nil
+            && accumulationCount >= verifyTargetFrame!
+        let needsScreenshot = pendingScreenshot
+        if needsScreenshot { pendingScreenshot = false }
+        if needsVerify || needsScreenshot { captureInProgress = true }
+
+        let verifyHDRTexture = makeVerifyHDRTexture(from: hdrSource,
+                                                    commandBuffer: commandBuffer,
+                                                    needsVerify: needsVerify)
+
+        guard let tonemapped = pathTracer.tonemappedTexture else {
+            onComplete?()
+            return
+        }
+
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            let drawableTexture = drawable.texture
+            let srcSize = MTLSize(width: min(tonemapped.width, drawableTexture.width),
+                                  height: min(tonemapped.height, drawableTexture.height),
+                                  depth: 1)
+            blit.copy(from: tonemapped,
+                      sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: srcSize,
+                      to: drawableTexture,
+                      destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+        }
+
+        commandBuffer.present(drawable)
+        commandBuffer.addCompletedHandler { [weak self] buffer in
+            if let self = self {
+                if hasExposureMeasurement {
+                    let measuredAverageLuminance = self.pathTracer.readMeasuredAverageLuminance()
+                    DispatchQueue.main.async {
+                        self.measuredAverageLuminance = measuredAverageLuminance
+                    }
+                }
+
+                self.completedFrames += 1
+                let elapsedMs = (CACurrentMediaTime() - submitTime) * 1000.0
+                if self.verifyConfig.enabled && submittedFrame <= 8 {
+                    let errorText = buffer.error.map { String(describing: $0) } ?? "none"
+                    print(String(format: "[Renderer] Complete frame #%u status=%@ elapsed=%.1fms error=%@ accumulation=%u",
+                                 submittedFrame,
+                                 self.debugDescription(for: buffer.status),
+                                 elapsedMs,
+                                 errorText,
+                                 self.accumulationCount))
+                }
+
+                if let tex = self.pathTracer.tonemappedTexture {
+                    if needsVerify {
+                        self.performVerifyCapture(texture: tex,
+                                                  hdrTexture: verifyHDRTexture,
+                                                  capturedFrame: verifyTargetFrame ?? self.accumulationCount)
+                    } else if needsScreenshot {
+                        self.performInteractiveScreenshot(texture: tex)
+                        DispatchQueue.main.async {
+                            self.captureInProgress = false
+                        }
+                    }
+                }
+            }
+            postCompletion?()
+            onComplete?()
+        }
+
+        commandBuffer.commit()
+    }
+
+    private func makeVerifyHDRTexture(from hdrSource: MTLTexture?,
+                                      commandBuffer: MTLCommandBuffer,
+                                      needsVerify: Bool) -> MTLTexture? {
+        guard needsVerify,
+              let hdrSource,
+              hdrSource.pixelFormat == .rgba32Float else {
+            return nil
+        }
+        return stageSharedTextureSnapshot(from: hdrSource, commandBuffer: commandBuffer)
+    }
+
+    private func prepareOIDNTexture(from sourceTexture: MTLTexture) -> MTLTexture? {
+        logOIDNAvailabilityIfNeeded()
+        guard let sourcePixels = ScreenshotCapture.readRGBA32FloatPixels(texture: sourceTexture,
+                                                                         commandQueue: commandQueue) else {
+            print("[Renderer] OIDN failed to read the accumulation buffer; falling back to raw accumulation")
+            return nil
+        }
+
+        let albedoPixels = pathTracer.albedoTexture.flatMap {
+            ScreenshotCapture.readRGBA16FloatPixels(texture: $0, commandQueue: commandQueue)
+        }
+        let normalPixels = pathTracer.normalTexture.flatMap {
+            ScreenshotCapture.readRGBA16FloatPixels(texture: $0, commandQueue: commandQueue)
+        }
+
+        guard let filteredPixels = oidnDenoiser.denoiseHDR(colorRGBA: sourcePixels,
+                                                           albedoRGBA: albedoPixels,
+                                                           normalRGBA: normalPixels,
+                                                           width: sourceTexture.width,
+                                                           height: sourceTexture.height),
+              let outputTexture = makeOIDNTexture(width: sourceTexture.width,
+                                                  height: sourceTexture.height,
+                                                  pixels: filteredPixels) else {
+            print("[Renderer] OIDN failed; falling back to raw accumulation")
+            return nil
+        }
+
+        return outputTexture
+    }
+
+    private func makeOIDNTexture(width: Int, height: Int, pixels: [Float]) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba32Float,
+                                                            width: width,
+                                                            height: height,
+                                                            mipmapped: false)
+        desc.storageMode = .shared
+        desc.usage = [.shaderRead]
+        guard let texture = device.makeTexture(descriptor: desc) else {
+            return nil
+        }
+
+        let bytesPerRow = width * MemoryLayout<Float>.stride * 4
+        pixels.withUnsafeBytes { bytes in
+            if let baseAddress = bytes.baseAddress {
+                texture.replace(region: MTLRegion(origin: MTLOrigin(x: 0, y: 0, z: 0),
+                                                  size: MTLSize(width: width, height: height, depth: 1)),
+                                mipmapLevel: 0,
+                                withBytes: baseAddress,
+                                bytesPerRow: bytesPerRow)
+            }
+        }
+        return texture
+    }
+
+    private func logOIDNAvailabilityIfNeeded() {
+        guard !hasLoggedOIDNAvailability else {
+            return
+        }
+
+        hasLoggedOIDNAvailability = true
+        print("[Renderer] OIDN: \(oidnDenoiser.availabilityDescription)")
+    }
+
+    private func stageSharedTextureSnapshot(from sourceTexture: MTLTexture,
+                                            commandBuffer: MTLCommandBuffer) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: sourceTexture.pixelFormat,
+                                                            width: sourceTexture.width,
+                                                            height: sourceTexture.height,
+                                                            mipmapped: false)
+        desc.storageMode = .shared
+        desc.usage = []
+        guard let snapshotTexture = device.makeTexture(descriptor: desc) else {
+            return nil
+        }
+
+        if let blit = commandBuffer.makeBlitCommandEncoder() {
+            blit.copy(from: sourceTexture,
+                      sourceSlice: 0, sourceLevel: 0,
+                      sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                      sourceSize: MTLSize(width: sourceTexture.width, height: sourceTexture.height, depth: 1),
+                      to: snapshotTexture,
+                      destinationSlice: 0, destinationLevel: 0,
+                      destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+            blit.endEncoding()
+        }
+
+        return snapshotTexture
+    }
+
+    private func shouldScheduleOIDNDenoise(for accumulationFrame: UInt32) -> Bool {
+        guard !oidnJobInFlight, accumulationFrame > oidnLatestFrame else {
+            return false
+        }
+
+        return accumulationFrame <= 4 || accumulationFrame.isMultiple(of: 4)
+    }
+
+    private func currentOIDNPresentationTexture() -> MTLTexture? {
+        guard let oidnLatestTexture,
+              let accumulationTexture = pathTracer.accumulatedTexture,
+              oidnLatestTexture.width == accumulationTexture.width,
+              oidnLatestTexture.height == accumulationTexture.height else {
+            return nil
+        }
+
+        return oidnLatestTexture
+    }
+
+    private func scheduleOIDNDenoise(colorTexture: MTLTexture,
+                                     albedoTexture: MTLTexture?,
+                                     normalTexture: MTLTexture?,
+                                     accumulationFrame: UInt32,
+                                     generation: UInt64) {
+        oidnQueue.async { [weak self] in
+            guard let self else {
+                return
+            }
+
+            let colorPixels = ScreenshotCapture.readRGBA32FloatPixels(texture: colorTexture,
+                                                                      commandQueue: self.commandQueue)
+            let albedoPixels = albedoTexture.flatMap {
+                ScreenshotCapture.readRGBA16FloatPixels(texture: $0, commandQueue: self.commandQueue)
+            }
+            let normalPixels = normalTexture.flatMap {
+                ScreenshotCapture.readRGBA16FloatPixels(texture: $0, commandQueue: self.commandQueue)
+            }
+
+            let filteredPixels = colorPixels.flatMap {
+                self.oidnDenoiser.denoiseHDR(colorRGBA: $0,
+                                             albedoRGBA: albedoPixels,
+                                             normalRGBA: normalPixels,
+                                             width: colorTexture.width,
+                                             height: colorTexture.height)
+            }
+            let filteredTexture = filteredPixels.flatMap {
+                self.makeOIDNTexture(width: colorTexture.width,
+                                     height: colorTexture.height,
+                                     pixels: $0)
+            }
+
+            DispatchQueue.main.async {
+                guard generation == self.oidnGeneration,
+                      self.selectedDenoiseMethod == .oidn else {
+                    self.oidnJobInFlight = false
+                    return
+                }
+
+                if let filteredTexture {
+                    self.oidnLatestTexture = filteredTexture
+                    self.oidnLatestFrame = accumulationFrame
+                }
+                self.oidnJobInFlight = false
+            }
         }
     }
 
@@ -715,11 +1164,27 @@ class Renderer {
 
     private func resetTemporalState(syncCameraHistory: Bool) {
         accumulationCount = 0
+        frameIndex = 0
+        camera.resetAccumulation()
         upscaler?.reset()
+        resetOIDNState()
         previousJitter = camera.jitterOffset
         if syncCameraHistory {
             camera.syncHistory()
         }
+    }
+
+    private func resetOIDNState() {
+        oidnGeneration += 1
+        oidnLatestTexture = nil
+        oidnLatestFrame = 0
+        oidnJobInFlight = false
+    }
+
+    private func resetExposureState() {
+        measuredAverageLuminance = exposureKeyValue
+        currentExposure = desiredExposure(forAverageLuminance: measuredAverageLuminance)
+        lastExposureUpdateTime = CACurrentMediaTime()
     }
 
     // MARK: - Helpers
@@ -759,6 +1224,96 @@ class Renderer {
         // Fallback: create assets directory in working dir
         try? fileManager.createDirectory(at: cwdAssets, withIntermediateDirectories: true)
         return cwdAssets
+    }
+
+    private func currentVerifyTargetFrame() -> UInt32? {
+        guard verifyConfig.enabled else {
+            return nil
+        }
+
+        if isCapturingReference(), let verifyReferenceFrame {
+            return verifyReferenceFrame
+        }
+
+        guard verifyCheckpointIndex < verifyCheckpointFrames.count else {
+            return nil
+        }
+
+        return verifyCheckpointFrames[verifyCheckpointIndex]
+    }
+
+    private func verifyOutputURL(capturedFrame: UInt32) -> URL {
+        let hasMultipleCaptures = verifyReferenceFrame != nil || verifyCheckpointFrames.count > 1 || verifySweepMethods.count > 1
+        if !hasMultipleCaptures {
+            return URL(fileURLWithPath: verifyConfig.outputPath)
+        }
+
+        let fileManager = FileManager.default
+        let baseDirectoryURL: URL
+        if let outputDirectory = verifyConfig.outputDirectory {
+            baseDirectoryURL = URL(fileURLWithPath: outputDirectory, isDirectory: true)
+        } else {
+            let outputURL = URL(fileURLWithPath: verifyConfig.outputPath)
+            if outputURL.pathExtension.isEmpty {
+                baseDirectoryURL = outputURL
+            } else {
+                baseDirectoryURL = outputURL.deletingPathExtension()
+            }
+        }
+
+        try? fileManager.createDirectory(at: baseDirectoryURL, withIntermediateDirectories: true)
+
+        let frameToken = String(format: "%04u", capturedFrame)
+        let renderToken = selectedRenderMode.rawValue
+        let denoiseToken = selectedDenoiseMethod.rawValue
+        let prefix = isCapturingReference() ? "reference_" : ""
+        let fileName = "\(prefix)\(renderToken)_\(denoiseToken)_f\(frameToken).png"
+        return baseDirectoryURL.appendingPathComponent(fileName)
+    }
+
+    private func advanceVerifyState() {
+        if verifyReferenceFrame != nil && !verifyReferenceReady {
+            verifyCompleted = true
+            let exitCode: Int32 = 1
+            NSApplication.shared.reply(toApplicationShouldTerminate: true)
+            exit(exitCode)
+        }
+
+        if verifyReferenceTransitionPending {
+            verifyReferenceTransitionPending = false
+            selectedDenoiseMethod = verifySweepMethods.first ?? selectedDenoiseMethod
+            print("[VERIFY] Captured reference; switching to test denoiser \(selectedDenoiseMethod.displayName)")
+            resetTemporalState(syncCameraHistory: true)
+            resetExposureState()
+            captureInProgress = false
+            return
+        }
+
+        if verifyCheckpointIndex + 1 < verifyCheckpointFrames.count {
+            verifyCheckpointIndex += 1
+            captureInProgress = false
+            return
+        }
+
+        if verifySweepIndex + 1 < verifySweepMethods.count {
+            verifySweepIndex += 1
+            selectedDenoiseMethod = verifySweepMethods[verifySweepIndex]
+            verifyCheckpointIndex = 0
+            print("[VERIFY] Switching accumulation denoiser to \(selectedDenoiseMethod.displayName)")
+            resetTemporalState(syncCameraHistory: true)
+            resetExposureState()
+            captureInProgress = false
+            return
+        }
+
+        verifyCompleted = true
+        let exitCode: Int32 = verifyAllPassed ? 0 : 1
+        NSApplication.shared.reply(toApplicationShouldTerminate: true)
+        exit(exitCode)
+    }
+
+    private func isCapturingReference() -> Bool {
+        verifyReferenceFrame != nil && !verifyReferenceReady
     }
 
     // MARK: - Test Scene (fallback when no BSP available)

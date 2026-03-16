@@ -37,10 +37,17 @@ struct VerifyConfig {
     var enabled = false
     var targetFrames: UInt32 = 64
     var outputPath = "verify_screenshot.png"
+    var outputDirectory: String?
+    var checkpointFrames: [UInt32] = []
+    var sweepDenoiseMethods = false
+    var referenceFrames: UInt32?
+    var referenceDenoiseMethod: DenoiseMethod = .none
 }
 
 enum DenoiseMethod: String, CaseIterable {
     case none
+    case oidn
+    case svgfPlus = "svgfplus"
     case eaw
     case bilateral
     case nlm
@@ -48,6 +55,8 @@ enum DenoiseMethod: String, CaseIterable {
     var displayName: String {
         switch self {
         case .none: return "None"
+        case .oidn: return "OIDN"
+        case .svgfPlus: return "SVGF+"
         case .eaw: return "EAW"
         case .bilateral: return "Bilateral"
         case .nlm: return "NLM"
@@ -88,6 +97,28 @@ private func parseVector3(_ rawValue: String) -> SIMD3<Float>? {
     return SIMD3<Float>(x, y, z)
 }
 
+private func parseFrameList(_ rawValue: String) -> [UInt32]? {
+    let parts = rawValue
+        .split(separator: ",")
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+
+    guard !parts.isEmpty else {
+        return nil
+    }
+
+    var frames: [UInt32] = []
+    frames.reserveCapacity(parts.count)
+
+    for part in parts {
+        guard let frame = UInt32(part), frame > 0 else {
+            return nil
+        }
+        frames.append(frame)
+    }
+
+    return Array(Set(frames)).sorted()
+}
+
 func parseLaunchArgs() -> LaunchConfig {
     var config = LaunchConfig()
     let args = Array(CommandLine.arguments.dropFirst())
@@ -110,6 +141,37 @@ func parseLaunchArgs() -> LaunchConfig {
                 failArgumentParsing("--verify-output requires a path")
             }
             config.verifyConfig.outputPath = args[index + 1]
+            index += 1
+        case "--verify-output-dir":
+            guard index + 1 < args.count else {
+                failArgumentParsing("--verify-output-dir requires a directory path")
+            }
+            config.verifyConfig.outputDirectory = args[index + 1]
+            index += 1
+        case "--verify-checkpoints":
+            guard index + 1 < args.count,
+                  let checkpoints = parseFrameList(args[index + 1]) else {
+                failArgumentParsing("--verify-checkpoints requires a comma-separated frame list, e.g. 1,2,4,8,16")
+            }
+            config.verifyConfig.checkpointFrames = checkpoints
+            if let lastCheckpoint = checkpoints.last {
+                config.verifyConfig.targetFrames = max(config.verifyConfig.targetFrames, lastCheckpoint)
+            }
+            index += 1
+        case "--verify-sweep-denoise":
+            config.verifyConfig.sweepDenoiseMethods = true
+        case "--verify-reference-frames":
+            guard index + 1 < args.count, let frameCount = UInt32(args[index + 1]), frameCount > 0 else {
+                failArgumentParsing("--verify-reference-frames requires a positive integer value")
+            }
+            config.verifyConfig.referenceFrames = frameCount
+            index += 1
+        case "--verify-reference-denoise-method":
+            guard index + 1 < args.count,
+                  let method = DenoiseMethod(rawValue: args[index + 1].lowercased()) else {
+                failArgumentParsing("--verify-reference-denoise-method requires one of: \(DenoiseMethod.argumentList)")
+            }
+            config.verifyConfig.referenceDenoiseMethod = method
             index += 1
         case "--start-pos", "--start-position":
             guard index + 3 < args.count,
@@ -169,6 +231,43 @@ func parseLaunchArgs() -> LaunchConfig {
                     failArgumentParsing("\(arg) must be one of: \(RenderMode.argumentList)")
                 }
                 config.renderMode = renderMode
+            } else if arg.hasPrefix("--denoise-method=") {
+                let components = arg.split(separator: "=", maxSplits: 1)
+                guard components.count == 2,
+                      let method = DenoiseMethod(rawValue: String(components[1]).lowercased()) else {
+                    failArgumentParsing("\(arg) must be one of: \(DenoiseMethod.argumentList)")
+                }
+                config.denoiseMethod = method
+            } else if arg.hasPrefix("--verify-output-dir=") {
+                let components = arg.split(separator: "=", maxSplits: 1)
+                guard components.count == 2 else {
+                    failArgumentParsing("\(arg) must be in the form --verify-output-dir=path")
+                }
+                config.verifyConfig.outputDirectory = String(components[1])
+            } else if arg.hasPrefix("--verify-checkpoints=") {
+                let components = arg.split(separator: "=", maxSplits: 1)
+                guard components.count == 2,
+                      let checkpoints = parseFrameList(String(components[1])) else {
+                    failArgumentParsing("\(arg) must be in the form --verify-checkpoints=1,2,4,8")
+                }
+                config.verifyConfig.checkpointFrames = checkpoints
+                if let lastCheckpoint = checkpoints.last {
+                    config.verifyConfig.targetFrames = max(config.verifyConfig.targetFrames, lastCheckpoint)
+                }
+            } else if arg.hasPrefix("--verify-reference-frames=") {
+                let components = arg.split(separator: "=", maxSplits: 1)
+                guard components.count == 2,
+                      let frameCount = UInt32(components[1]), frameCount > 0 else {
+                    failArgumentParsing("\(arg) must be in the form --verify-reference-frames=256")
+                }
+                config.verifyConfig.referenceFrames = frameCount
+            } else if arg.hasPrefix("--verify-reference-denoise-method=") {
+                let components = arg.split(separator: "=", maxSplits: 1)
+                guard components.count == 2,
+                      let method = DenoiseMethod(rawValue: String(components[1]).lowercased()) else {
+                    failArgumentParsing("\(arg) must be one of: \(DenoiseMethod.argumentList)")
+                }
+                config.verifyConfig.referenceDenoiseMethod = method
             }
         }
 

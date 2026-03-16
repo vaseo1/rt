@@ -77,6 +77,8 @@ class PathTracer {
     private var accumulateClampedPipeline: MTLComputePipelineState!
     private var svgfTemporalPipeline: MTLComputePipelineState!
     private var svgfATrousPipeline: MTLComputePipelineState!
+    private var accumulationMomentsPipeline: MTLComputePipelineState!
+    private var accumulationSVGFPlusPipeline: MTLComputePipelineState!
     private var svgfRemodPipeline: MTLComputePipelineState!
     private var svgfDemodPipeline: MTLComputePipelineState!
     private var postATrousPipeline: MTLComputePipelineState!
@@ -157,6 +159,19 @@ class PathTracer {
         var _pad2: UInt32
     }
 
+    private struct AccumulationSVGFPlusUniforms {
+        var renderWidth: UInt32
+        var renderHeight: UInt32
+        var stepWidth: UInt32
+        var passIndex: UInt32
+        var accumulationCount: UInt32
+        var _pad0: UInt32
+        var colorPhiScale: Float
+        var normalPhi: Float
+        var depthPhi: Float
+        var albedoPhi: Float
+    }
+
     private struct CrossBilateralUniforms {
         var renderWidth: UInt32
         var renderHeight: UInt32
@@ -188,6 +203,7 @@ class PathTracer {
     }
 
     private let eawStepWidths: [UInt32] = [1, 2, 4, 8, 16]
+    private let accumulationSVGFPlusStepWidths: [UInt32] = [1, 2, 4, 8]
 
     private func buildPipelines() {
         guard let library = device.makeDefaultLibrary() else {
@@ -210,6 +226,8 @@ class PathTracer {
         accumulateClampedPipeline = makePipeline("accumulateClampedKernel")
         svgfTemporalPipeline = makePipeline("svgfTemporalKernel")
         svgfATrousPipeline = makePipeline("svgfATrousKernel")
+        accumulationMomentsPipeline = makePipeline("estimateAccumulationMomentsKernel")
+        accumulationSVGFPlusPipeline = makePipeline("accumulationSVGFPlusKernel")
         svgfRemodPipeline = makePipeline("svgfRemodulateKernel")
         svgfDemodPipeline = makePipeline("svgfDemodulateKernel")
         postATrousPipeline = makePipeline("postATrousKernel")
@@ -393,6 +411,99 @@ class PathTracer {
 
     /// Post-filter: Demodulate → EAW (5-pass A-Trous) → Remodulate.
     /// Applied as a post-filter on the accumulated image.
+    func encodeAccumulationSVGFPlus(commandBuffer: MTLCommandBuffer,
+                                    uniforms: inout Uniforms,
+                                    sourceTexture: MTLTexture) -> MTLTexture? {
+        guard let depthTex = depthTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
+              let pingTex = svgfPingTexture,
+              let pongTex = svgfPongTexture,
+              let momentsTex = svgfMomentsTexture else {
+            return nil
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+        let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Accum SVGF+ Demodulate"
+            encoder.setComputePipelineState(svgfDemodPipeline)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(pingTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Accum SVGF+ Moments"
+            encoder.setComputePipelineState(accumulationMomentsPipeline)
+            encoder.setTexture(pingTex, index: 0)
+            encoder.setTexture(momentsTex, index: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        var filterUniforms = AccumulationSVGFPlusUniforms(
+            renderWidth: uniforms.renderWidth,
+            renderHeight: uniforms.renderHeight,
+            stepWidth: 1,
+            passIndex: 0,
+            accumulationCount: uniforms.accumulationCount,
+            _pad0: 0,
+            colorPhiScale: 1.6,
+            normalPhi: 192.0,
+            depthPhi: 4.0,
+            albedoPhi: 18.0
+        )
+
+        var srcTex: MTLTexture = pingTex
+        var dstTex: MTLTexture = pongTex
+
+        for (passIndex, stepWidth) in accumulationSVGFPlusStepWidths.enumerated() {
+            filterUniforms.stepWidth = stepWidth
+            filterUniforms.passIndex = UInt32(passIndex)
+
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "Accum SVGF+ A-Trous \(passIndex)"
+                encoder.setComputePipelineState(accumulationSVGFPlusPipeline)
+                encoder.setBytes(&filterUniforms,
+                                 length: MemoryLayout<AccumulationSVGFPlusUniforms>.size,
+                                 index: 0)
+                encoder.setTexture(srcTex, index: 0)
+                encoder.setTexture(momentsTex, index: 1)
+                encoder.setTexture(depthTex, index: 2)
+                encoder.setTexture(normalTex, index: 3)
+                encoder.setTexture(albedoTex, index: 4)
+                encoder.setTexture(dstTex, index: 5)
+                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                encoder.endEncoding()
+            }
+
+            let previousTarget = dstTex
+            srcTex = previousTarget
+            dstTex = (previousTarget === pingTex) ? pongTex : pingTex
+        }
+
+        let remodTarget = dstTex
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Accum SVGF+ Remodulate"
+            encoder.setComputePipelineState(svgfRemodPipeline)
+            encoder.setTexture(srcTex, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(remodTarget, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        return remodTarget
+    }
+
     func encodePostATrous(commandBuffer: MTLCommandBuffer,
                           uniforms: inout Uniforms,
                           sourceTexture: MTLTexture) -> MTLTexture? {

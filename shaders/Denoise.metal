@@ -339,6 +339,127 @@ struct PostFilterUniforms {
     uint _pad2;
 };
 
+struct AccumulationSVGFPlusUniforms {
+    uint renderWidth;
+    uint renderHeight;
+    uint stepWidth;
+    uint passIndex;
+    uint accumulationCount;
+    uint _pad0;
+    float colorPhiScale;
+    float normalPhi;
+    float depthPhi;
+    float albedoPhi;
+};
+
+kernel void estimateAccumulationMomentsKernel(
+    uint2 tid [[thread_position_in_grid]],
+    texture2d<float, access::read> sourceColor [[texture(0)]],
+    texture2d<float, access::write> momentsTexture [[texture(1)]]
+) {
+    uint width = sourceColor.get_width();
+    uint height = sourceColor.get_height();
+    if (tid.x >= width || tid.y >= height) return;
+
+    float m1 = 0.0f;
+    float m2 = 0.0f;
+
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int sx = clamp(int(tid.x) + dx, 0, int(width) - 1);
+            int sy = clamp(int(tid.y) + dy, 0, int(height) - 1);
+            float lum = luminance(sourceColor.read(uint2(sx, sy)).rgb);
+            m1 += lum;
+            m2 += lum * lum;
+        }
+    }
+
+    momentsTexture.write(float4(m1 / 9.0f, m2 / 9.0f, 0.0f, 0.0f), tid);
+}
+
+kernel void accumulationSVGFPlusKernel(
+    uint2 tid [[thread_position_in_grid]],
+    constant AccumulationSVGFPlusUniforms& uniforms [[buffer(0)]],
+    texture2d<float, access::read> sourceColor [[texture(0)]],
+    texture2d<float, access::read> momentsTexture [[texture(1)]],
+    texture2d<float, access::read> depthTexture [[texture(2)]],
+    texture2d<float, access::read> normalTexture [[texture(3)]],
+    texture2d<float, access::read> albedoTexture [[texture(4)]],
+    texture2d<float, access::write> outputTexture [[texture(5)]]
+) {
+    if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) return;
+
+    float3 centerColor = sourceColor.read(tid).rgb;
+    float2 centerMoments = momentsTexture.read(tid).xy;
+    float centerDepth = depthTexture.read(tid).x;
+    float4 centerNormal = normalTexture.read(tid);
+    float4 centerAlbedo = albedoTexture.read(tid);
+    bool centerHasSurface = centerNormal.w > 0.5f;
+
+    float centerLum = luminance(centerColor);
+    float variance = max(centerMoments.y - centerMoments.x * centerMoments.x, 0.0f);
+    float sigma = sqrt(variance + 1e-6f);
+    float accumScale = clamp(4.0f / sqrt(max(float(uniforms.accumulationCount), 1.0f)), 0.25f, 1.35f);
+    float passScale = 1.0f / (1.0f + 0.35f * float(uniforms.passIndex));
+    float colorPhi = max(uniforms.colorPhiScale * accumScale * passScale * sigma, 1.25e-3f);
+    float clipExtent = max((1.6f - 0.15f * min(float(uniforms.passIndex), 3.0f)) * sigma * (1.0f + 0.5f * accumScale), 2.5e-3f);
+    float clippedUpperLum = centerMoments.x + clipExtent;
+
+    float3 filteredColor = float3(0.0f);
+    float accumulatedWeight = 0.0f;
+
+    for (int ky = -2; ky <= 2; ky++) {
+        for (int kx = -2; kx <= 2; kx++) {
+            int sx = clamp(int(tid.x) + kx * int(uniforms.stepWidth), 0, int(uniforms.renderWidth) - 1);
+            int sy = clamp(int(tid.y) + ky * int(uniforms.stepWidth), 0, int(uniforms.renderHeight) - 1);
+            uint2 sc = uint2(sx, sy);
+
+            float3 sampleColor = sourceColor.read(sc).rgb;
+            float sampleDepth = depthTexture.read(sc).x;
+            float4 sampleNormal = normalTexture.read(sc);
+            float4 sampleAlbedo = albedoTexture.read(sc);
+            bool sampleHasSurface = sampleNormal.w > 0.5f;
+            float sampleLum = luminance(sampleColor);
+
+            if (sampleLum > clippedUpperLum && sampleLum > 1e-4f) {
+                sampleColor *= clippedUpperLum / sampleLum;
+                sampleLum = clippedUpperLum;
+            }
+
+            float kernelWeight = kATrousKernel[kx + 2] * kATrousKernel[ky + 2];
+
+            float depthWeight = 1.0f;
+            float normalWeight = 1.0f;
+            float albedoWeight = 1.0f;
+
+            if (centerHasSurface && sampleHasSurface) {
+                depthWeight = exp(-abs(sampleDepth - centerDepth) * uniforms.depthPhi / max(float(uniforms.stepWidth), 1.0f));
+                normalWeight = pow(saturate(dot(normalize(sampleNormal.xyz), normalize(centerNormal.xyz))), uniforms.normalPhi);
+                albedoWeight = exp(-length(sampleAlbedo.rgb - centerAlbedo.rgb) * uniforms.albedoPhi);
+            } else if (centerHasSurface != sampleHasSurface) {
+                depthWeight = 0.0f;
+                normalWeight = 0.0f;
+                albedoWeight = 0.0f;
+            }
+
+            float colorDelta = abs(sampleLum - centerLum);
+            float colorWeight = exp(-colorDelta / colorPhi);
+
+            float weight = kernelWeight * depthWeight * normalWeight * albedoWeight * colorWeight;
+            filteredColor += sampleColor * weight;
+            accumulatedWeight += weight;
+        }
+    }
+
+    float3 normalizedFilteredColor = filteredColor / max(accumulatedWeight, 1e-4f);
+    float varianceWeight = sigma / (sigma + max(centerLum, 5e-3f));
+    float accumulationBlend = clamp(2.4f / max(float(uniforms.accumulationCount), 1.0f), 0.06f, 0.55f);
+    float filterBlend = clamp(max(varianceWeight, 0.15f) * accumulationBlend, 0.0f, 1.0f);
+    float3 blendedColor = mix(centerColor, normalizedFilteredColor, filterBlend);
+
+    outputTexture.write(float4(blendedColor, 1.0f), tid);
+}
+
 // ─── EAW: Edge-Aware Wavelet (A-Trous without convergence cutoff) ───────────
 //
 // Same A-Trous 5×5 filter as svgfATrousKernel but without history-length-based
@@ -535,7 +656,6 @@ kernel void nlmDenoiseKernel(
     int sr = uniforms.searchRadius;
     int pr = uniforms.patchRadius;
 
-    float3 centerColor = sourceColor.read(tid).rgb;
     float centerDepth = depthTexture.read(tid).x;
     float4 centerNormal = normalTexture.read(tid);
     float4 centerAlbedo = albedoTexture.read(tid);

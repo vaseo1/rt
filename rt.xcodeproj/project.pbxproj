@@ -12,6 +12,7 @@
 		2D591D814F7E76ECFF681E82 /* Common.metal in Sources */ = {isa = PBXBuildFile; fileRef = 66EF89AC761B051B352CEF25 /* Common.metal */; };
 		32A5E65E2B58264B9E7F7C19 /* ScreenshotCapture.swift in Sources */ = {isa = PBXBuildFile; fileRef = 728DC2B94DAC3133F2B84CB6 /* ScreenshotCapture.swift */; };
 		487B5B24548BCE34B3E00556 /* Bloom.metal in Sources */ = {isa = PBXBuildFile; fileRef = EE4C2D668FD6B837B7E59230 /* Bloom.metal */; };
+		51B9CB5E553A09AC5C082D5A /* OIDNDenoiser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8D7D2CB6FCE32168C5BB1045 /* OIDNDenoiser.swift */; };
 		62BD2D9D52A00AF3B9D13A5A /* Renderer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 77883A96BA83A34AF97E11C4 /* Renderer.swift */; };
 		8321218655436168B81A45AB /* PathTrace.metal in Sources */ = {isa = PBXBuildFile; fileRef = FF2E9F6E08FBB140B9C3AC54 /* PathTrace.metal */; };
 		AAC181CE4EE0F991E87E85C0 /* main.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76315360BFB3A857281CA99B /* main.swift */; };
@@ -36,6 +37,7 @@
 		76315360BFB3A857281CA99B /* main.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = main.swift; sourceTree = "<group>"; };
 		77883A96BA83A34AF97E11C4 /* Renderer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Renderer.swift; sourceTree = "<group>"; };
 		81F422F8DC03F14B3741A496 /* SceneGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SceneGeometry.swift; sourceTree = "<group>"; };
+		8D7D2CB6FCE32168C5BB1045 /* OIDNDenoiser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OIDNDenoiser.swift; sourceTree = "<group>"; };
 		BFBAA98B6CC6224948AE13C3 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
 		EBF55833F79D9E9255184B0F /* Camera.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Camera.swift; sourceTree = "<group>"; };
 		EE2A7DAFCFDAE3640846AC3D /* AccelStructure.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccelStructure.swift; sourceTree = "<group>"; };
@@ -84,6 +86,7 @@
 			isa = PBXGroup;
 			children = (
 				EE2A7DAFCFDAE3640846AC3D /* AccelStructure.swift */,
+				8D7D2CB6FCE32168C5BB1045 /* OIDNDenoiser.swift */,
 				00C062B8A6DD1D1FAE796CFB /* PathTracer.swift */,
 				77883A96BA83A34AF97E11C4 /* Renderer.swift */,
 				728DC2B94DAC3133F2B84CB6 /* ScreenshotCapture.swift */,
@@ -193,6 +196,7 @@
 				04798D471DE7E705F85F610B /* Denoise.metal in Sources */,
 				FA3730B75F9BE163AF304FFE /* GameView.swift in Sources */,
 				C593BB199968ECFD298F1EE0 /* MetalFXUpscaler.swift in Sources */,
+				51B9CB5E553A09AC5C082D5A /* OIDNDenoiser.swift in Sources */,
 				8321218655436168B81A45AB /* PathTrace.metal in Sources */,
 				F536A560128CCEE57A9A904F /* PathTracer.swift in Sources */,
 				62BD2D9D52A00AF3B9D13A5A /* Renderer.swift in Sources */,
