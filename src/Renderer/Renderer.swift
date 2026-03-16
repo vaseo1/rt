@@ -580,7 +580,7 @@ class Renderer {
 
     private func preferredRenderMode(isMoving: Bool) -> RenderMode {
         if selectedRenderMode == .auto {
-            return isMoving ? .metalfx : .svgf
+            return .svgf
         }
 
         return selectedRenderMode

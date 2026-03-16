@@ -26,37 +26,42 @@ constexpr sampler linearClampSampler(coord::normalized,
                                      address::clamp_to_edge,
                                      filter::linear);
 
+inline float3 clampFireflies(float3 color, float maxLuminance) {
+    float lum = luminance(color);
+    if (lum > maxLuminance) {
+        color *= maxLuminance / lum;
+    }
+    return color;
+}
+
 inline float3 clampHistoryToNeighborhood(uint2 tid,
                                          texture2d<float, access::read> currentColor,
-                                         float3 historyColor) {
+                                         float3 historyRadiance,
+                                         float sigmaScale) {
     uint width = currentColor.get_width();
     uint height = currentColor.get_height();
 
-    float3 colorMin = float3(FLT_MAX);
-    float3 colorMax = float3(-FLT_MAX);
-    float luminanceSum = 0.0f;
-    float luminanceSqSum = 0.0f;
+    float3 m1 = float3(0.0f);
+    float3 m2 = float3(0.0f);
 
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             int sampleX = clamp(int(tid.x) + dx, 0, int(width) - 1);
             int sampleY = clamp(int(tid.y) + dy, 0, int(height) - 1);
-            float3 sampleColor = currentColor.read(uint2(sampleX, sampleY)).rgb;
-            colorMin = min(colorMin, sampleColor);
-            colorMax = max(colorMax, sampleColor);
+            uint2 sCoord = uint2(sampleX, sampleY);
 
-            float sampleLuminance = luminance(sampleColor);
-            luminanceSum += sampleLuminance;
-            luminanceSqSum += sampleLuminance * sampleLuminance;
+            float3 radiance = currentColor.read(sCoord).rgb;
+            m1 += radiance;
+            m2 += radiance * radiance;
         }
     }
 
-    float mean = luminanceSum / 9.0f;
-    float variance = max(luminanceSqSum / 9.0f - mean * mean, 0.0f);
-    float sigma = sqrt(variance + 1e-5f) * 1.25f;
-    colorMin -= sigma;
-    colorMax += sigma;
-    return clamp(historyColor, colorMin, colorMax);
+    float3 mean = m1 / 9.0f;
+    float3 variance = max(m2 / 9.0f - mean * mean, float3(0.0f));
+    float3 sigma = sqrt(variance + 1e-5f) * sigmaScale;
+    float3 colorMin = mean - sigma;
+    float3 colorMax = mean + sigma;
+    return clamp(historyRadiance, colorMin, colorMax);
 }
 
 inline bool isHistoryValid(float2 prevUV,
@@ -119,8 +124,13 @@ kernel void svgfTemporalKernel(
     float2 motion = currentMotion.read(tid).xy;
     float4 currentNormalValue = currentNormal.read(tid);
     float4 currentAlbedoValue = currentAlbedo.read(tid);
-    float currentLuminance = luminance(current);
-    float2 currentMoments = float2(currentLuminance, currentLuminance * currentLuminance);
+
+    // Firefly suppression
+    current = clampFireflies(current, 25.0f);
+
+    // Temporal accumulation in RADIANCE space (demodulation only for spatial filter)
+    float radLuminance = luminance(current);
+    float2 currentMoments = float2(radLuminance, radLuminance * radLuminance);
 
     if (uniforms.accumulationCount <= 1) {
         temporalColorOut.write(float4(current, 1.0f), tid);
@@ -149,19 +159,26 @@ kernel void svgfTemporalKernel(
                                                   previousAlbedoValue);
 
     float historyLengthValue = 1.0f;
-    float3 temporalColor = current;
+    float3 temporalRadiance = current;
     float2 temporalMoments = currentMoments;
 
     if (historyValid) {
-        float3 clampedHistory = clampHistoryToNeighborhood(tid, currentColor, previousColorValue.rgb);
-        historyLengthValue = min(previousHistoryLength + 1.0f, 32.0f);
-        float alpha = max(1.0f / historyLengthValue, 0.05f);
-        float momentsAlpha = max(alpha, 0.2f);
-        temporalColor = mix(clampedHistory, current, alpha);
+        historyLengthValue = min(previousHistoryLength + 1.0f, 64.0f);
+        float alpha = 1.0f / historyLengthValue;
+
+        // Only clamp history for early frames; once converged, let temporal accumulate freely
+        float3 history = previousColorValue.rgb;
+        if (previousHistoryLength < 8.0f) {
+            float clampSigmaScale = 1.0f + previousHistoryLength * 0.25f;
+            history = clampHistoryToNeighborhood(tid, currentColor, history, clampSigmaScale);
+        }
+
+        float momentsAlpha = max(alpha, 0.1f);
+        temporalRadiance = mix(history, current, alpha);
         temporalMoments = mix(previousMomentsValue, currentMoments, momentsAlpha);
     }
 
-    temporalColorOut.write(float4(temporalColor, 1.0f), tid);
+    temporalColorOut.write(float4(temporalRadiance, 1.0f), tid);
     momentsOut.write(float4(temporalMoments, 0.0f, 0.0f), tid);
     historyLengthOut.write(float4(historyLengthValue, 0.0f, 0.0f, 0.0f), tid);
 }
@@ -174,7 +191,8 @@ kernel void svgfATrousKernel(
     texture2d<float, access::read> depthTexture [[texture(2)]],
     texture2d<float, access::read> normalTexture [[texture(3)]],
     texture2d<float, access::read> albedoTexture [[texture(4)]],
-    texture2d<float, access::write> outputTexture [[texture(5)]]
+    texture2d<float, access::write> outputTexture [[texture(5)]],
+    texture2d<float, access::read> historyLengthTexture [[texture(6)]]
 ) {
     if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) {
         return;
@@ -187,8 +205,18 @@ kernel void svgfATrousKernel(
     float4 centerAlbedo = albedoTexture.read(tid);
     bool centerHasSurface = centerNormal.w > 0.5f;
 
+    // Adaptive spatial filter strength based on temporal convergence
+    float historyLength = historyLengthTexture.read(tid).x;
+    float adaptiveScale = clamp(3.0f / max(historyLength, 1.0f), 0.0f, 2.0f);
+
+    // Skip spatial filter when temporal has sufficiently converged (>6 frames)
+    if (adaptiveScale < 0.4f) {
+        outputTexture.write(float4(centerColor, 1.0f), tid);
+        return;
+    }
+
     float variance = max(centerMoments.y - centerMoments.x * centerMoments.x, 0.0f);
-    float colorPhi = max(uniforms.colorPhiScale * sqrt(variance + 1e-4f), 2.5e-3f);
+    float colorPhi = max(uniforms.colorPhiScale * adaptiveScale * sqrt(variance + 1e-4f), 2.5e-3f);
 
     float3 filteredColor = float3(0.0f);
     float accumulatedWeight = 0.0f;
@@ -215,7 +243,7 @@ kernel void svgfATrousKernel(
             float normalWeight = 1.0f;
             float albedoWeight = 1.0f;
             if (centerHasSurface && sampleHasSurface) {
-                depthWeight = exp(-abs(sampleDepth - centerDepth) * uniforms.depthPhi * float(uniforms.stepWidth));
+                depthWeight = exp(-abs(sampleDepth - centerDepth) * uniforms.depthPhi / max(float(uniforms.stepWidth), 1.0f));
                 normalWeight = pow(saturate(dot(normalize(sampleNormal.xyz), normalize(centerNormal.xyz))),
                                    uniforms.normalPhi);
                 albedoWeight = exp(-length(sampleAlbedo.rgb - centerAlbedo.rgb) * uniforms.albedoPhi);
@@ -236,4 +264,50 @@ kernel void svgfATrousKernel(
 
     float safeWeight = max(accumulatedWeight, 1e-4f);
     outputTexture.write(float4(filteredColor / safeWeight, 1.0f), tid);
+}
+
+// ─── Demodulate: radiance / albedo → irradiance ──────────────────────────────
+
+kernel void svgfDemodulateKernel(
+    uint2 tid [[thread_position_in_grid]],
+    texture2d<float, access::read> radianceTexture [[texture(0)]],
+    texture2d<float, access::read> normalTexture [[texture(1)]],
+    texture2d<float, access::read> albedoTexture [[texture(2)]],
+    texture2d<float, access::write> outputTexture [[texture(3)]]
+) {
+    uint width = outputTexture.get_width();
+    uint height = outputTexture.get_height();
+    if (tid.x >= width || tid.y >= height) return;
+
+    float3 rad = radianceTexture.read(tid).rgb;
+    float4 normalValue = normalTexture.read(tid);
+    bool hasSurface = normalValue.w > 0.5f;
+
+    float3 albedo = hasSurface ? max(albedoTexture.read(tid).rgb, float3(0.03f)) : float3(1.0f);
+    float3 irr = rad / albedo;
+
+    outputTexture.write(float4(irr, 1.0f), tid);
+}
+
+// ─── Remodulate: irradiance × albedo → final radiance ────────────────────────
+
+kernel void svgfRemodulateKernel(
+    uint2 tid [[thread_position_in_grid]],
+    texture2d<float, access::read> irradiance [[texture(0)]],
+    texture2d<float, access::read> normalTexture [[texture(1)]],
+    texture2d<float, access::read> albedoTexture [[texture(2)]],
+    texture2d<float, access::write> outputTexture [[texture(3)]]
+) {
+    uint width = outputTexture.get_width();
+    uint height = outputTexture.get_height();
+    if (tid.x >= width || tid.y >= height) return;
+
+    float3 irr = irradiance.read(tid).rgb;
+    float4 normalValue = normalTexture.read(tid);
+    bool hasSurface = normalValue.w > 0.5f;
+
+    float3 albedo = hasSurface ? max(albedoTexture.read(tid).rgb, float3(0.03f)) : float3(1.0f);
+    float3 result = irr * albedo;
+
+    outputTexture.write(float4(result, 1.0f), tid);
 }

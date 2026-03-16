@@ -76,6 +76,8 @@ class PathTracer {
     private var accumulatePipeline: MTLComputePipelineState!
     private var svgfTemporalPipeline: MTLComputePipelineState!
     private var svgfATrousPipeline: MTLComputePipelineState!
+    private var svgfRemodPipeline: MTLComputePipelineState!
+    private var svgfDemodPipeline: MTLComputePipelineState!
     private var measureExposurePipeline: MTLComputePipelineState!
     private var extractBloomPipeline: MTLComputePipelineState!
     private var blurBloomPipeline: MTLComputePipelineState!
@@ -155,6 +157,8 @@ class PathTracer {
         accumulatePipeline = makePipeline("accumulateKernel")
         svgfTemporalPipeline = makePipeline("svgfTemporalKernel")
         svgfATrousPipeline = makePipeline("svgfATrousKernel")
+        svgfRemodPipeline = makePipeline("svgfRemodulateKernel")
+        svgfDemodPipeline = makePipeline("svgfDemodulateKernel")
         measureExposurePipeline = makePipeline("measureExposureKernel")
         extractBloomPipeline = makePipeline("extractBloomKernel")
         blurBloomPipeline = makePipeline("blurBloomKernel")
@@ -357,14 +361,27 @@ class PathTracer {
             renderHeight: uniforms.renderHeight,
             stepWidth: 1,
             passIndex: 0,
-            colorPhiScale: 1.5,
+            colorPhiScale: 2.0,
             normalPhi: 128.0,
-            depthPhi: 256.0,
-            albedoPhi: 24.0
+            depthPhi: 2.0,
+            albedoPhi: 12.0
         )
 
-        var sourceTexture: MTLTexture = temporalTex
-        var targetTexture: MTLTexture = pingTex
+        // Demodulate: temporal radiance → irradiance (into pingTex)
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "SVGF Demodulate"
+            encoder.setComputePipelineState(svgfDemodPipeline)
+            encoder.setTexture(temporalTex, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(pingTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        // A-Trous passes operate on irradiance
+        var sourceTexture: MTLTexture = pingTex
+        var targetTexture: MTLTexture = pongTex
 
         for (passIndex, stepWidth) in svgfStepWidths.enumerated() {
             filterUniforms.stepWidth = stepWidth
@@ -382,6 +399,7 @@ class PathTracer {
                 encoder.setTexture(normalTex, index: 3)
                 encoder.setTexture(albedoTex, index: 4)
                 encoder.setTexture(targetTexture, index: 5)
+                encoder.setTexture(historyLengthScratchTex, index: 6)
                 encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
                 encoder.endEncoding()
             }
@@ -391,7 +409,22 @@ class PathTracer {
             targetTexture = (previousTarget === pingTex) ? pongTex : pingTex
         }
 
-        svgfFilteredTexture = sourceTexture
+        // Remodulate: irradiance × albedo → radiance
+        let remodSource = sourceTexture
+        let remodTarget = targetTexture
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "SVGF Remodulate"
+            encoder.setComputePipelineState(svgfRemodPipeline)
+            encoder.setTexture(remodSource, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(remodTarget, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        svgfFilteredTexture = remodTarget
 
         if let blit = commandBuffer.makeBlitCommandEncoder() {
             blit.label = "SVGF History Update"
