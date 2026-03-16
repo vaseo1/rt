@@ -34,6 +34,55 @@ kernel void accumulateKernel(
     outputFrame.write(result, tid);
 }
 
+// ─── Outlier-Clamped Accumulation Kernel ─────────────────────────────────────
+//
+// Same running average as accumulateKernel, but clamps the incoming sample's
+// luminance to the 3×3 neighborhood [mean ± k·σ] before blending.
+// Prevents single bright firefly samples from contaminating the running average.
+
+kernel void accumulateClampedKernel(
+    uint2                             tid           [[thread_position_in_grid]],
+    constant Uniforms&                uniforms      [[buffer(0)]],
+    texture2d<float, access::read>    currentFrame  [[texture(0)]],
+    texture2d<float, access::read>    historyFrame  [[texture(1)]],
+    texture2d<float, access::write>   outputFrame   [[texture(2)]]
+) {
+    if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) return;
+
+    float4 current = currentFrame.read(tid);
+
+    // Clamp incoming sample to 3×3 neighborhood statistics
+    float3 m1 = float3(0.0f);
+    float3 m2 = float3(0.0f);
+    for (int dy = -1; dy <= 1; dy++) {
+        for (int dx = -1; dx <= 1; dx++) {
+            int sx = clamp(int(tid.x) + dx, 0, int(uniforms.renderWidth) - 1);
+            int sy = clamp(int(tid.y) + dy, 0, int(uniforms.renderHeight) - 1);
+            float3 s = currentFrame.read(uint2(sx, sy)).rgb;
+            m1 += s;
+            m2 += s * s;
+        }
+    }
+    float3 mean = m1 / 9.0f;
+    float3 variance = max(m2 / 9.0f - mean * mean, float3(0.0f));
+    float3 sigma = sqrt(variance + 1e-5f);
+    float sigmaScale = 2.0f;
+    current.rgb = clamp(current.rgb, mean - sigma * sigmaScale, mean + sigma * sigmaScale);
+
+    float N = float(uniforms.accumulationCount);
+
+    float4 result;
+    if (N <= 1.0f) {
+        result = current;
+    } else {
+        float4 history = historyFrame.read(tid);
+        float weight = 1.0f / N;
+        result = mix(history, current, weight);
+    }
+
+    outputFrame.write(result, tid);
+}
+
 // ─── Tonemap + Display Kernel ────────────────────────────────────────────────
 //
 // Reads accumulated HDR buffer, applies ACES filmic tonemapping + sRGB gamma,

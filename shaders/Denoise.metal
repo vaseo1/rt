@@ -321,3 +321,276 @@ kernel void svgfRemodulateKernel(
 
     outputTexture.write(float4(result, 1.0f), tid);
 }
+
+// ─── Post-filter uniforms (shared by EAW, Bilateral, NLM) ───────────────────
+
+struct PostFilterUniforms {
+    uint renderWidth;
+    uint renderHeight;
+    uint stepWidth;
+    uint passIndex;
+    float colorPhiScale;
+    float normalPhi;
+    float depthPhi;
+    float albedoPhi;
+    uint accumulationCount;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+// ─── EAW: Edge-Aware Wavelet (A-Trous without convergence cutoff) ───────────
+//
+// Same A-Trous 5×5 filter as svgfATrousKernel but without history-length-based
+// adaptive scaling or convergence cutoff. Filter strength adapts to accumulation
+// count instead: stronger at low spp, gentler at high spp. Intended as a
+// post-filter on the accumulated image.
+
+kernel void postATrousKernel(
+    uint2 tid [[thread_position_in_grid]],
+    constant PostFilterUniforms& uniforms [[buffer(0)]],
+    texture2d<float, access::read> sourceColor [[texture(0)]],
+    texture2d<float, access::read> depthTexture [[texture(1)]],
+    texture2d<float, access::read> normalTexture [[texture(2)]],
+    texture2d<float, access::read> albedoTexture [[texture(3)]],
+    texture2d<float, access::write> outputTexture [[texture(4)]]
+) {
+    if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) return;
+
+    float3 centerColor = sourceColor.read(tid).rgb;
+    float centerDepth = depthTexture.read(tid).x;
+    float4 centerNormal = normalTexture.read(tid);
+    float4 centerAlbedo = albedoTexture.read(tid);
+    bool centerHasSurface = centerNormal.w > 0.5f;
+
+    // Adaptive strength: stronger at low accumulation, gentler when converged
+    float accumScale = clamp(8.0f / max(float(uniforms.accumulationCount), 1.0f), 0.15f, 2.0f);
+    float centerLum = luminance(centerColor);
+    float colorPhi = max(uniforms.colorPhiScale * accumScale * sqrt(max(centerLum, 0.0f) + 1e-4f), 2.5e-3f);
+
+    float3 filteredColor = float3(0.0f);
+    float accumulatedWeight = 0.0f;
+
+    for (int ky = -2; ky <= 2; ky++) {
+        for (int kx = -2; kx <= 2; kx++) {
+            int sx = clamp(int(tid.x) + kx * int(uniforms.stepWidth), 0, int(uniforms.renderWidth) - 1);
+            int sy = clamp(int(tid.y) + ky * int(uniforms.stepWidth), 0, int(uniforms.renderHeight) - 1);
+            uint2 sc = uint2(sx, sy);
+
+            float3 sampleColor = sourceColor.read(sc).rgb;
+            float sampleDepth = depthTexture.read(sc).x;
+            float4 sampleNormal = normalTexture.read(sc);
+            float4 sampleAlbedo = albedoTexture.read(sc);
+            bool sampleHasSurface = sampleNormal.w > 0.5f;
+
+            float kernelWeight = kATrousKernel[kx + 2] * kATrousKernel[ky + 2];
+
+            float depthWeight = 1.0f;
+            float normalWeight = 1.0f;
+            float albedoWeight = 1.0f;
+            if (centerHasSurface && sampleHasSurface) {
+                depthWeight = exp(-abs(sampleDepth - centerDepth) * uniforms.depthPhi / max(float(uniforms.stepWidth), 1.0f));
+                normalWeight = pow(saturate(dot(normalize(sampleNormal.xyz), normalize(centerNormal.xyz))), uniforms.normalPhi);
+                albedoWeight = exp(-length(sampleAlbedo.rgb - centerAlbedo.rgb) * uniforms.albedoPhi);
+            } else if (centerHasSurface != sampleHasSurface) {
+                depthWeight = 0.0f;
+                normalWeight = 0.0f;
+                albedoWeight = 0.0f;
+            }
+
+            float colorDelta = abs(luminance(sampleColor) - centerLum);
+            float colorWeight = exp(-colorDelta / colorPhi);
+            float w = kernelWeight * depthWeight * normalWeight * albedoWeight * colorWeight;
+
+            filteredColor += sampleColor * w;
+            accumulatedWeight += w;
+        }
+    }
+
+    outputTexture.write(float4(filteredColor / max(accumulatedWeight, 1e-4f), 1.0f), tid);
+}
+
+// ─── Cross-Bilateral Filter ─────────────────────────────────────────────────
+//
+// G-buffer-guided Gaussian bilateral filter with configurable radius.
+// Weights: Gaussian_spatial × depth × normal × albedo × color similarity.
+// Better edge preservation than A-Trous for fine geometric detail.
+
+struct CrossBilateralUniforms {
+    uint renderWidth;
+    uint renderHeight;
+    int radius;          // kernel half-size (e.g. 5 → 11×11)
+    uint accumulationCount;
+    float sigmaSpatial;  // spatial Gaussian sigma
+    float sigmaColor;    // color similarity sigma
+    float depthPhi;
+    float normalPhi;
+    float albedoPhi;
+    float _pad0;
+    float _pad1;
+    float _pad2;
+};
+
+kernel void crossBilateralKernel(
+    uint2 tid [[thread_position_in_grid]],
+    constant CrossBilateralUniforms& uniforms [[buffer(0)]],
+    texture2d<float, access::read> sourceColor [[texture(0)]],
+    texture2d<float, access::read> depthTexture [[texture(1)]],
+    texture2d<float, access::read> normalTexture [[texture(2)]],
+    texture2d<float, access::read> albedoTexture [[texture(3)]],
+    texture2d<float, access::write> outputTexture [[texture(4)]]
+) {
+    if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) return;
+
+    float3 centerColor = sourceColor.read(tid).rgb;
+    float centerDepth = depthTexture.read(tid).x;
+    float4 centerNormal = normalTexture.read(tid);
+    float4 centerAlbedo = albedoTexture.read(tid);
+    bool centerHasSurface = centerNormal.w > 0.5f;
+    float centerLum = luminance(centerColor);
+
+    float invSigmaSpatial2 = -0.5f / (uniforms.sigmaSpatial * uniforms.sigmaSpatial);
+    float invSigmaColor2 = -0.5f / (uniforms.sigmaColor * uniforms.sigmaColor);
+
+    float3 filteredColor = float3(0.0f);
+    float totalWeight = 0.0f;
+
+    int r = uniforms.radius;
+
+    for (int dy = -r; dy <= r; dy++) {
+        for (int dx = -r; dx <= r; dx++) {
+            int sx = clamp(int(tid.x) + dx, 0, int(uniforms.renderWidth) - 1);
+            int sy = clamp(int(tid.y) + dy, 0, int(uniforms.renderHeight) - 1);
+            uint2 sc = uint2(sx, sy);
+
+            float3 sampleColor = sourceColor.read(sc).rgb;
+            float sampleDepth = depthTexture.read(sc).x;
+            float4 sampleNormal = normalTexture.read(sc);
+            float4 sampleAlbedo = albedoTexture.read(sc);
+            bool sampleHasSurface = sampleNormal.w > 0.5f;
+
+            // Spatial weight
+            float dist2 = float(dx * dx + dy * dy);
+            float wSpatial = exp(dist2 * invSigmaSpatial2);
+
+            // Color weight
+            float colorDelta = abs(luminance(sampleColor) - centerLum);
+            float wColor = exp(colorDelta * colorDelta * invSigmaColor2);
+
+            // G-buffer weights
+            float wDepth = 1.0f;
+            float wNormal = 1.0f;
+            float wAlbedo = 1.0f;
+            if (centerHasSurface && sampleHasSurface) {
+                wDepth = exp(-abs(sampleDepth - centerDepth) * uniforms.depthPhi);
+                wNormal = pow(saturate(dot(normalize(sampleNormal.xyz), normalize(centerNormal.xyz))), uniforms.normalPhi);
+                wAlbedo = exp(-length(sampleAlbedo.rgb - centerAlbedo.rgb) * uniforms.albedoPhi);
+            } else if (centerHasSurface != sampleHasSurface) {
+                wSpatial = 0.0f;
+            }
+
+            float w = wSpatial * wColor * wDepth * wNormal * wAlbedo;
+            filteredColor += sampleColor * w;
+            totalWeight += w;
+        }
+    }
+
+    outputTexture.write(float4(filteredColor / max(totalWeight, 1e-4f), 1.0f), tid);
+}
+
+// ─── Non-Local Means Filter ─────────────────────────────────────────────────
+//
+// Patch-based denoiser: for each pixel, searches a window, compares patches,
+// and averages weighted by patch similarity. G-buffer pre-rejection trims the
+// search space. Best quality for MC noise but expensive (~11k taps/pixel).
+
+struct NLMUniforms {
+    uint renderWidth;
+    uint renderHeight;
+    int searchRadius;    // search window half-size (e.g. 10 → 21×21)
+    int patchRadius;     // patch half-size (e.g. 2 → 5×5)
+    float h;             // filter strength (higher = more smoothing)
+    float depthRejectThreshold;
+    float normalRejectDot;
+    float albedoRejectDelta;
+    uint accumulationCount;
+    uint _pad0;
+    uint _pad1;
+    uint _pad2;
+};
+
+kernel void nlmDenoiseKernel(
+    uint2 tid [[thread_position_in_grid]],
+    constant NLMUniforms& uniforms [[buffer(0)]],
+    texture2d<float, access::read> sourceColor [[texture(0)]],
+    texture2d<float, access::read> depthTexture [[texture(1)]],
+    texture2d<float, access::read> normalTexture [[texture(2)]],
+    texture2d<float, access::read> albedoTexture [[texture(3)]],
+    texture2d<float, access::write> outputTexture [[texture(4)]]
+) {
+    if (tid.x >= uniforms.renderWidth || tid.y >= uniforms.renderHeight) return;
+
+    int w = int(uniforms.renderWidth);
+    int h = int(uniforms.renderHeight);
+    int sr = uniforms.searchRadius;
+    int pr = uniforms.patchRadius;
+
+    float3 centerColor = sourceColor.read(tid).rgb;
+    float centerDepth = depthTexture.read(tid).x;
+    float4 centerNormal = normalTexture.read(tid);
+    float4 centerAlbedo = albedoTexture.read(tid);
+    bool centerHasSurface = centerNormal.w > 0.5f;
+
+    float invH2 = 1.0f / (uniforms.h * uniforms.h);
+    int patchSize = (2 * pr + 1);
+    float invPatchArea = 1.0f / float(patchSize * patchSize);
+
+    float3 filteredColor = float3(0.0f);
+    float totalWeight = 0.0f;
+
+    for (int sy = -sr; sy <= sr; sy++) {
+        for (int sx = -sr; sx <= sr; sx++) {
+            int qx = clamp(int(tid.x) + sx, 0, w - 1);
+            int qy = clamp(int(tid.y) + sy, 0, h - 1);
+            uint2 qc = uint2(qx, qy);
+
+            // G-buffer pre-rejection
+            if (centerHasSurface) {
+                float qDepth = depthTexture.read(qc).x;
+                float4 qNormal = normalTexture.read(qc);
+                float4 qAlbedo = albedoTexture.read(qc);
+                bool qHasSurface = qNormal.w > 0.5f;
+
+                if (!qHasSurface) continue;
+                if (abs(qDepth - centerDepth) > uniforms.depthRejectThreshold) continue;
+                if (dot(normalize(qNormal.xyz), normalize(centerNormal.xyz)) < uniforms.normalRejectDot) continue;
+                if (length(qAlbedo.rgb - centerAlbedo.rgb) > uniforms.albedoRejectDelta) continue;
+            }
+
+            // Patch distance
+            float patchDist2 = 0.0f;
+            for (int py = -pr; py <= pr; py++) {
+                for (int px = -pr; px <= pr; px++) {
+                    int cx = clamp(int(tid.x) + px, 0, w - 1);
+                    int cy = clamp(int(tid.y) + py, 0, h - 1);
+                    int rx = clamp(qx + px, 0, w - 1);
+                    int ry = clamp(qy + py, 0, h - 1);
+
+                    float3 cp = sourceColor.read(uint2(cx, cy)).rgb;
+                    float3 rp = sourceColor.read(uint2(rx, ry)).rgb;
+                    float3 diff = cp - rp;
+                    patchDist2 += dot(diff, diff);
+                }
+            }
+
+            float avgDist2 = patchDist2 * invPatchArea;
+            float weight = exp(-max(avgDist2 * invH2, 0.0f));
+
+            float3 qColor = sourceColor.read(qc).rgb;
+            filteredColor += qColor * weight;
+            totalWeight += weight;
+        }
+    }
+
+    outputTexture.write(float4(filteredColor / max(totalWeight, 1e-4f), 1.0f), tid);
+}

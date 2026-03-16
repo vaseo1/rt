@@ -22,6 +22,7 @@ class Renderer {
     let verifyConfig: VerifyConfig
     private(set) var selectedRenderMode: RenderMode
     private(set) var activeRenderMode: RenderMode
+    private(set) var selectedDenoiseMethod: DenoiseMethod
 
     private var pathTracer: PathTracer
     private var accelBuilder: AccelStructureBuilder
@@ -72,6 +73,7 @@ class Renderer {
         self.verifyConfig = launchConfig.verifyConfig
         self.selectedRenderMode = launchConfig.renderMode
         self.activeRenderMode = launchConfig.renderMode
+        self.selectedDenoiseMethod = launchConfig.denoiseMethod
         self.startupCameraPosition = launchConfig.startPosition ?? Self.defaultStartupCameraPosition
         self.startupCameraYaw = Self.defaultStartupCameraYawDegrees * .pi / 180.0
         self.startupCameraPitch = Self.defaultStartupCameraPitchDegrees * .pi / 180.0
@@ -122,7 +124,11 @@ class Renderer {
         case .raw:
             return "1spp"
         case .accumulation:
-            return "\(max(accumulationCount, 1))spp"
+            let base = "\(max(accumulationCount, 1))spp"
+            if selectedDenoiseMethod != .none {
+                return "\(base)+\(selectedDenoiseMethod.displayName)"
+            }
+            return base
         case .svgf, .metalfx, .metalfxSVGF, .auto:
             return "\(max(accumulationCount, 1))h"
         }
@@ -144,6 +150,18 @@ class Renderer {
         activeRenderMode = selectedRenderMode
         resetTemporalState(syncCameraHistory: true)
         print("[Renderer] Render mode: \(selectedRenderMode.displayName)")
+    }
+
+    func cycleDenoiseMethod() {
+        guard let currentIndex = DenoiseMethod.allCases.firstIndex(of: selectedDenoiseMethod) else {
+            return
+        }
+
+        let nextIndex = DenoiseMethod.allCases.index(after: currentIndex)
+        selectedDenoiseMethod = nextIndex == DenoiseMethod.allCases.endIndex
+            ? DenoiseMethod.allCases[0]
+            : DenoiseMethod.allCases[nextIndex]
+        print("[Renderer] Denoise method: \(selectedDenoiseMethod.displayName)")
     }
 
     // MARK: - Scene Loading
@@ -434,10 +452,37 @@ class Renderer {
         case .raw:
             hdrSource = pathTracer.colorTexture
         case .accumulation:
-            pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
-                                          uniforms: &uniforms)
+            if selectedDenoiseMethod != .none {
+                pathTracer.encodeClampedAccumulation(commandBuffer: commandBuffer,
+                                                     uniforms: &uniforms)
+            } else {
+                pathTracer.encodeAccumulation(commandBuffer: commandBuffer,
+                                              uniforms: &uniforms)
+            }
             pathTracer.copyAccumulationToHistory(commandBuffer: commandBuffer)
-            hdrSource = pathTracer.accumulatedTexture
+            if selectedDenoiseMethod != .none, let accumTex = pathTracer.accumulatedTexture {
+                switch selectedDenoiseMethod {
+                case .eaw:
+                    hdrSource = pathTracer.encodePostATrous(
+                        commandBuffer: commandBuffer,
+                        uniforms: &uniforms,
+                        sourceTexture: accumTex) ?? accumTex
+                case .bilateral:
+                    hdrSource = pathTracer.encodeCrossBilateral(
+                        commandBuffer: commandBuffer,
+                        uniforms: &uniforms,
+                        sourceTexture: accumTex) ?? accumTex
+                case .nlm:
+                    hdrSource = pathTracer.encodeNLM(
+                        commandBuffer: commandBuffer,
+                        uniforms: &uniforms,
+                        sourceTexture: accumTex) ?? accumTex
+                case .none:
+                    hdrSource = accumTex
+                }
+            } else {
+                hdrSource = pathTracer.accumulatedTexture
+            }
         case .svgf:
             hdrSource = pathTracer.encodeSVGF(commandBuffer: commandBuffer,
                                               uniforms: &uniforms) ?? pathTracer.colorTexture

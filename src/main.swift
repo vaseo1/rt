@@ -39,6 +39,26 @@ struct VerifyConfig {
     var outputPath = "verify_screenshot.png"
 }
 
+enum DenoiseMethod: String, CaseIterable {
+    case none
+    case eaw
+    case bilateral
+    case nlm
+
+    var displayName: String {
+        switch self {
+        case .none: return "None"
+        case .eaw: return "EAW"
+        case .bilateral: return "Bilateral"
+        case .nlm: return "NLM"
+        }
+    }
+
+    static var argumentList: String {
+        allCases.map(\.rawValue).joined(separator: ", ")
+    }
+}
+
 struct LaunchConfig {
     var verifyConfig = VerifyConfig()
     var startPosition: SIMD3<Float>?
@@ -46,6 +66,7 @@ struct LaunchConfig {
     var lookAtWater = false
     var highlightWater = false
     var renderMode: RenderMode = .accumulation
+    var denoiseMethod: DenoiseMethod = .none
 }
 
 private func failArgumentParsing(_ message: String) -> Never {
@@ -118,6 +139,13 @@ func parseLaunchArgs() -> LaunchConfig {
                 failArgumentParsing("--render-mode requires one of: \(RenderMode.argumentList)")
             }
             config.renderMode = renderMode
+            index += 1
+        case "--denoise-method":
+            guard index + 1 < args.count,
+                  let method = DenoiseMethod(rawValue: args[index + 1].lowercased()) else {
+                failArgumentParsing("--denoise-method requires one of: \(DenoiseMethod.argumentList)")
+            }
+            config.denoiseMethod = method
             index += 1
         default:
             if arg.hasPrefix("--start-pos=") || arg.hasPrefix("--start-position=") {

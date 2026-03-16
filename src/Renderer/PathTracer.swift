@@ -74,10 +74,14 @@ class PathTracer {
 
     private var pathTracePipeline: MTLComputePipelineState!
     private var accumulatePipeline: MTLComputePipelineState!
+    private var accumulateClampedPipeline: MTLComputePipelineState!
     private var svgfTemporalPipeline: MTLComputePipelineState!
     private var svgfATrousPipeline: MTLComputePipelineState!
     private var svgfRemodPipeline: MTLComputePipelineState!
     private var svgfDemodPipeline: MTLComputePipelineState!
+    private var postATrousPipeline: MTLComputePipelineState!
+    private var crossBilateralPipeline: MTLComputePipelineState!
+    private var nlmPipeline: MTLComputePipelineState!
     private var clearR16Pipeline: MTLComputePipelineState!
     private var measureExposurePipeline: MTLComputePipelineState!
     private var extractBloomPipeline: MTLComputePipelineState!
@@ -138,6 +142,53 @@ class PathTracer {
         var albedoPhi: Float
     }
 
+    private struct PostFilterUniforms {
+        var renderWidth: UInt32
+        var renderHeight: UInt32
+        var stepWidth: UInt32
+        var passIndex: UInt32
+        var colorPhiScale: Float
+        var normalPhi: Float
+        var depthPhi: Float
+        var albedoPhi: Float
+        var accumulationCount: UInt32
+        var _pad0: UInt32
+        var _pad1: UInt32
+        var _pad2: UInt32
+    }
+
+    private struct CrossBilateralUniforms {
+        var renderWidth: UInt32
+        var renderHeight: UInt32
+        var radius: Int32
+        var accumulationCount: UInt32
+        var sigmaSpatial: Float
+        var sigmaColor: Float
+        var depthPhi: Float
+        var normalPhi: Float
+        var albedoPhi: Float
+        var _pad0: Float
+        var _pad1: Float
+        var _pad2: Float
+    }
+
+    private struct NLMUniforms {
+        var renderWidth: UInt32
+        var renderHeight: UInt32
+        var searchRadius: Int32
+        var patchRadius: Int32
+        var h: Float
+        var depthRejectThreshold: Float
+        var normalRejectDot: Float
+        var albedoRejectDelta: Float
+        var accumulationCount: UInt32
+        var _pad0: UInt32
+        var _pad1: UInt32
+        var _pad2: UInt32
+    }
+
+    private let eawStepWidths: [UInt32] = [1, 2, 4, 8, 16]
+
     private func buildPipelines() {
         guard let library = device.makeDefaultLibrary() else {
             fatalError("Failed to load Metal library. Ensure .metal files are in the Xcode target.")
@@ -156,10 +207,14 @@ class PathTracer {
 
         pathTracePipeline = makePipeline("pathTraceKernel")
         accumulatePipeline = makePipeline("accumulateKernel")
+        accumulateClampedPipeline = makePipeline("accumulateClampedKernel")
         svgfTemporalPipeline = makePipeline("svgfTemporalKernel")
         svgfATrousPipeline = makePipeline("svgfATrousKernel")
         svgfRemodPipeline = makePipeline("svgfRemodulateKernel")
         svgfDemodPipeline = makePipeline("svgfDemodulateKernel")
+        postATrousPipeline = makePipeline("postATrousKernel")
+        crossBilateralPipeline = makePipeline("crossBilateralKernel")
+        nlmPipeline = makePipeline("nlmDenoiseKernel")
         clearR16Pipeline = makePipeline("clearR16Kernel")
         measureExposurePipeline = makePipeline("measureExposureKernel")
         extractBloomPipeline = makePipeline("extractBloomKernel")
@@ -308,6 +363,276 @@ class PathTracer {
             blit.copy(from: accumTex, to: historyTex)
             blit.endEncoding()
         }
+    }
+
+    func encodeClampedAccumulation(commandBuffer: MTLCommandBuffer,
+                                   uniforms: inout Uniforms) {
+        guard let colorTex = colorTexture,
+              let historyTex = historyTexture,
+              let accumTex = accumulatedTexture else {
+            return
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Accumulate (Clamped)"
+            encoder.setComputePipelineState(accumulateClampedPipeline)
+            encoder.setBytes(&uniforms, length: MemoryLayout<Uniforms>.size, index: 0)
+            encoder.setTexture(colorTex, index: 0)
+            encoder.setTexture(historyTex, index: 1)
+            encoder.setTexture(accumTex, index: 2)
+
+            let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+            let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+    }
+
+    /// Post-filter: Demodulate → EAW (5-pass A-Trous) → Remodulate.
+    /// Applied as a post-filter on the accumulated image.
+    func encodePostATrous(commandBuffer: MTLCommandBuffer,
+                          uniforms: inout Uniforms,
+                          sourceTexture: MTLTexture) -> MTLTexture? {
+        guard let depthTex = depthTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
+              let pingTex = svgfPingTexture,
+              let pongTex = svgfPongTexture else {
+            return nil
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+        let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+
+        // Demodulate: radiance → irradiance (into pingTex)
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "EAW Demodulate"
+            encoder.setComputePipelineState(svgfDemodPipeline)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(pingTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        var filterUniforms = PostFilterUniforms(
+            renderWidth: uniforms.renderWidth,
+            renderHeight: uniforms.renderHeight,
+            stepWidth: 1,
+            passIndex: 0,
+            colorPhiScale: 2.0,
+            normalPhi: 128.0,
+            depthPhi: 2.0,
+            albedoPhi: 12.0,
+            accumulationCount: uniforms.accumulationCount,
+            _pad0: 0, _pad1: 0, _pad2: 0
+        )
+
+        var srcTex: MTLTexture = pingTex
+        var dstTex: MTLTexture = pongTex
+
+        for (passIndex, stepWidth) in eawStepWidths.enumerated() {
+            filterUniforms.stepWidth = stepWidth
+            filterUniforms.passIndex = UInt32(passIndex)
+
+            if let encoder = commandBuffer.makeComputeCommandEncoder() {
+                encoder.label = "EAW A-Trous \(passIndex)"
+                encoder.setComputePipelineState(postATrousPipeline)
+                encoder.setBytes(&filterUniforms,
+                                 length: MemoryLayout<PostFilterUniforms>.size,
+                                 index: 0)
+                encoder.setTexture(srcTex, index: 0)
+                encoder.setTexture(depthTex, index: 1)
+                encoder.setTexture(normalTex, index: 2)
+                encoder.setTexture(albedoTex, index: 3)
+                encoder.setTexture(dstTex, index: 4)
+                encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+                encoder.endEncoding()
+            }
+
+            let prev = dstTex
+            srcTex = prev
+            dstTex = (prev === pingTex) ? pongTex : pingTex
+        }
+
+        // Remodulate: irradiance × albedo → radiance
+        let remodTarget = dstTex
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "EAW Remodulate"
+            encoder.setComputePipelineState(svgfRemodPipeline)
+            encoder.setTexture(srcTex, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(remodTarget, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        return remodTarget
+    }
+
+    /// Post-filter: Demodulate → Cross-Bilateral → Remodulate.
+    func encodeCrossBilateral(commandBuffer: MTLCommandBuffer,
+                              uniforms: inout Uniforms,
+                              sourceTexture: MTLTexture) -> MTLTexture? {
+        guard let depthTex = depthTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
+              let pingTex = svgfPingTexture,
+              let pongTex = svgfPongTexture else {
+            return nil
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+        let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+
+        // Demodulate
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bilateral Demodulate"
+            encoder.setComputePipelineState(svgfDemodPipeline)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(pingTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        // Adaptive radius: larger when noisy (low spp), smaller when converged
+        let accumCount = max(uniforms.accumulationCount, 1)
+        let adaptiveRadius: Int32 = accumCount < 8 ? 5 : (accumCount < 32 ? 4 : 3)
+        let adaptiveSigmaColor: Float = accumCount < 8 ? 0.3 : (accumCount < 32 ? 0.15 : 0.08)
+
+        var bilateralUniforms = CrossBilateralUniforms(
+            renderWidth: uniforms.renderWidth,
+            renderHeight: uniforms.renderHeight,
+            radius: adaptiveRadius,
+            accumulationCount: uniforms.accumulationCount,
+            sigmaSpatial: Float(adaptiveRadius) * 0.6,
+            sigmaColor: adaptiveSigmaColor,
+            depthPhi: 2.0,
+            normalPhi: 128.0,
+            albedoPhi: 12.0,
+            _pad0: 0, _pad1: 0, _pad2: 0
+        )
+
+        // Bilateral filter
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Cross-Bilateral"
+            encoder.setComputePipelineState(crossBilateralPipeline)
+            encoder.setBytes(&bilateralUniforms,
+                             length: MemoryLayout<CrossBilateralUniforms>.size,
+                             index: 0)
+            encoder.setTexture(pingTex, index: 0)
+            encoder.setTexture(depthTex, index: 1)
+            encoder.setTexture(normalTex, index: 2)
+            encoder.setTexture(albedoTex, index: 3)
+            encoder.setTexture(pongTex, index: 4)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        // Remodulate
+        let resultTex = pingTex
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Bilateral Remodulate"
+            encoder.setComputePipelineState(svgfRemodPipeline)
+            encoder.setTexture(pongTex, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(resultTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        return resultTex
+    }
+
+    /// Post-filter: Demodulate → Non-Local Means → Remodulate.
+    func encodeNLM(commandBuffer: MTLCommandBuffer,
+                   uniforms: inout Uniforms,
+                   sourceTexture: MTLTexture) -> MTLTexture? {
+        guard let depthTex = depthTexture,
+              let normalTex = normalTexture,
+              let albedoTex = albedoTexture,
+              let pingTex = svgfPingTexture,
+              let pongTex = svgfPongTexture else {
+            return nil
+        }
+
+        let renderW = Int(uniforms.renderWidth)
+        let renderH = Int(uniforms.renderHeight)
+        let threadgroupSize = MTLSize(width: 8, height: 8, depth: 1)
+        let gridSize = MTLSize(width: renderW, height: renderH, depth: 1)
+
+        // Demodulate
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "NLM Demodulate"
+            encoder.setComputePipelineState(svgfDemodPipeline)
+            encoder.setTexture(sourceTexture, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(pingTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        // Adaptive NLM parameters based on accumulation count
+        let accumCount = max(uniforms.accumulationCount, 1)
+        let adaptiveH: Float = accumCount < 8 ? 0.6 : (accumCount < 32 ? 0.3 : 0.15)
+        let adaptiveSearchRadius: Int32 = accumCount < 16 ? 10 : 7
+
+        var nlmUniforms = NLMUniforms(
+            renderWidth: uniforms.renderWidth,
+            renderHeight: uniforms.renderHeight,
+            searchRadius: adaptiveSearchRadius,
+            patchRadius: 2,
+            h: adaptiveH,
+            depthRejectThreshold: 0.05,
+            normalRejectDot: 0.7,
+            albedoRejectDelta: 0.25,
+            accumulationCount: uniforms.accumulationCount,
+            _pad0: 0, _pad1: 0, _pad2: 0
+        )
+
+        // NLM filter
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "Non-Local Means"
+            encoder.setComputePipelineState(nlmPipeline)
+            encoder.setBytes(&nlmUniforms,
+                             length: MemoryLayout<NLMUniforms>.size,
+                             index: 0)
+            encoder.setTexture(pingTex, index: 0)
+            encoder.setTexture(depthTex, index: 1)
+            encoder.setTexture(normalTex, index: 2)
+            encoder.setTexture(albedoTex, index: 3)
+            encoder.setTexture(pongTex, index: 4)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        // Remodulate
+        let resultTex = pingTex
+        if let encoder = commandBuffer.makeComputeCommandEncoder() {
+            encoder.label = "NLM Remodulate"
+            encoder.setComputePipelineState(svgfRemodPipeline)
+            encoder.setTexture(pongTex, index: 0)
+            encoder.setTexture(normalTex, index: 1)
+            encoder.setTexture(albedoTex, index: 2)
+            encoder.setTexture(resultTex, index: 3)
+            encoder.dispatchThreads(gridSize, threadsPerThreadgroup: threadgroupSize)
+            encoder.endEncoding()
+        }
+
+        return resultTex
     }
 
     func encodeSVGF(commandBuffer: MTLCommandBuffer,

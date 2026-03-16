@@ -28,6 +28,7 @@ class GameView: NSView, CALayerDelegate {
     private let keyLeftShift: UInt16 = 56
     private let keyRightShift: UInt16 = 60
     private let keyM: UInt16 = 46
+    private let keyN: UInt16 = 45
     private let keyF12: UInt16 = 111
 
     init(frame: NSRect, device: MTLDevice) {
@@ -189,6 +190,11 @@ class GameView: NSView, CALayerDelegate {
         } else if event.keyCode == keyM {
             if !event.isARepeat {
                 renderer?.cycleRenderMode()
+            }
+            return
+        } else if event.keyCode == keyN {
+            if !event.isARepeat {
+                renderer?.cycleDenoiseMethod()
             }
             return
         } else if event.keyCode == keyF12 {
