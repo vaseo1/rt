@@ -12,6 +12,10 @@ import simd
 //   3. Tonemap + present to drawable
 
 class Renderer {
+    private static let defaultStartupCameraPosition = SIMD3<Float>(480, 50, 150)
+    private static let defaultStartupCameraYawDegrees: Float = 0
+    private static let defaultStartupCameraPitchDegrees: Float = 0
+
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let camera = Camera()
@@ -24,7 +28,10 @@ class Renderer {
     private var scene: SceneGeometry
     private var upscaler: MetalFXUpscaler?
     private(set) var sceneTitleLabel: String = "test"
-    private let startupCameraPosition: SIMD3<Float>?
+    private let startupCameraPosition: SIMD3<Float>
+    private let startupCameraYaw: Float
+    private let startupCameraPitch: Float
+    private let hasExplicitStartupCameraPosition: Bool
     private let startupLookAtPosition: SIMD3<Float>?
     private let lookAtWaterOnLoad: Bool
     private let highlightWater: Bool
@@ -65,7 +72,10 @@ class Renderer {
         self.verifyConfig = launchConfig.verifyConfig
         self.selectedRenderMode = launchConfig.renderMode
         self.activeRenderMode = launchConfig.renderMode
-        self.startupCameraPosition = launchConfig.startPosition
+        self.startupCameraPosition = launchConfig.startPosition ?? Self.defaultStartupCameraPosition
+        self.startupCameraYaw = Self.defaultStartupCameraYawDegrees * .pi / 180.0
+        self.startupCameraPitch = Self.defaultStartupCameraPitchDegrees * .pi / 180.0
+        self.hasExplicitStartupCameraPosition = launchConfig.startPosition != nil
         self.startupLookAtPosition = launchConfig.lookAtPosition
         self.lookAtWaterOnLoad = launchConfig.lookAtWater
         self.highlightWater = launchConfig.highlightWater
@@ -221,26 +231,27 @@ class Renderer {
             return liquidSurface.position + liquidSurface.normal * 96.0
         }
 
-        if lookAtWaterOnLoad, startupCameraPosition == nil, let waterFramingPosition {
+        if lookAtWaterOnLoad, !hasExplicitStartupCameraPosition, let waterFramingPosition {
             print(String(format: "[Renderer] Water framing camera=(%.1f, %.1f, %.1f)",
                          waterFramingPosition.x,
                          waterFramingPosition.y,
                          waterFramingPosition.z))
         }
 
-        // Set camera to spawn position
-        if let startupCameraPosition {
-            camera.position = startupCameraPosition
-            print(String(format: "[Renderer] Camera start override=(%.1f, %.1f, %.1f)",
-                         startupCameraPosition.x,
-                         startupCameraPosition.y,
-                         startupCameraPosition.z))
-        } else if lookAtWaterOnLoad, let waterFramingPosition {
+        // Use the configured startup pose unless look-at-water requests its framing shot.
+        if lookAtWaterOnLoad, !hasExplicitStartupCameraPosition, let waterFramingPosition {
             camera.position = waterFramingPosition
         } else {
-            camera.position = data.spawnPosition
+            camera.position = startupCameraPosition
         }
-        camera.yaw = data.spawnAngle
+        camera.yaw = startupCameraYaw
+        camera.pitch = startupCameraPitch
+        print(String(format: "[Renderer] Camera start=(%.1f, %.1f, %.1f) view=(%.0f, %.0f)",
+                     camera.position.x,
+                     camera.position.y,
+                     camera.position.z,
+                     camera.yaw * 180.0 / .pi,
+                     camera.pitch * 180.0 / .pi))
 
         if lookAtWaterOnLoad, let liquidSurface = data.preferredLiquidSurface {
             camera.lookAt(target: liquidSurface.position)

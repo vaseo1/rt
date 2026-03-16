@@ -21,6 +21,7 @@ open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --ar
 open ~/Library/Developer/Xcode/DerivedData/rt-*/Build/Products/Debug/rt.app --args --render-mode svgf
 ```
 
+- Default startup camera pose is `p480,50,150 | v0/0` as shown in the window title.
 - `--start-pos x y z` or `--start-pos=x,y,z`: override the BSP spawn position with engine-space coordinates after the map loads.
 - `--look-at x y z` or `--look-at=x,y,z`: orient the camera toward a target point after the start position is applied.
 - `--look-at-water`: aim the camera at the detected water surface; if no explicit start position is given, move to a top-down framing position above it.
