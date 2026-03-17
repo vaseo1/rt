@@ -1107,8 +1107,9 @@ class PathTracer {
 
     func encodeTonemap(commandBuffer: MTLCommandBuffer,
                        uniforms: inout Uniforms,
-                       sourceTexture: MTLTexture) {
-        guard let tonemapTex = tonemappedTexture else {
+                       sourceTexture: MTLTexture,
+                       targetTexture: MTLTexture? = nil) {
+        guard let tonemapTex = targetTexture ?? tonemappedTexture else {
             return
         }
 

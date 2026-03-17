@@ -3,6 +3,20 @@ import Metal
 import QuartzCore
 
 class GameView: NSView, CALayerDelegate {
+    private struct InputSnapshot {
+        var forward = false
+        var back = false
+        var left = false
+        var right = false
+        var up = false
+        var sprint = false
+        var mouseDeltaX: Float = 0
+        var mouseDeltaY: Float = 0
+        var cycleRenderMode = false
+        var cycleDenoiseMethod = false
+        var requestScreenshot = false
+    }
+
     private struct ScriptedOIDNRepro {
         private let baselineCaptureFrame: UInt32 = 180
         private let movementStartFrame: UInt32 = 181
@@ -54,14 +68,20 @@ class GameView: NSView, CALayerDelegate {
     let metalLayer: CAMetalLayer
     var renderer: Renderer?
     private var displayLink: CVDisplayLink?
+    private let renderQueue = DispatchQueue(label: "dev.rt.render", qos: .userInteractive)
+    private let inputLock = NSLock()
+    private var renderFrameQueued = false
     private var keysPressed: Set<UInt16> = []
     private var mouseCaptured = false
     private var mouseDeltaX: Float = 0
     private var mouseDeltaY: Float = 0
     private var shiftPressed = false
+    private var pendingRenderModeCycle = false
+    private var pendingDenoiseMethodCycle = false
+    private var pendingScreenshotRequest = false
 
-    // Limit in-flight frames so nextDrawable() never blocks the main thread
-    private let frameSemaphore = DispatchSemaphore(value: 2)
+    // Match CAMetalLayer triple buffering so the GPU can stay busier on fast Apple Silicon.
+    private let frameSemaphore = DispatchSemaphore(value: 3)
     private var debugFrameNumber: UInt32 = 0
     private var loggedSemaphoreSaturation = false
 
@@ -141,8 +161,12 @@ class GameView: NSView, CALayerDelegate {
             width: newSize.width * scale,
             height: newSize.height * scale
         )
-        renderer?.resize(width: Int(newSize.width * scale),
-                         height: Int(newSize.height * scale))
+        let drawableWidth = Int(newSize.width * scale)
+        let drawableHeight = Int(newSize.height * scale)
+        renderQueue.async { [weak self] in
+            self?.renderer?.resize(width: drawableWidth,
+                                   height: drawableHeight)
+        }
     }
 
     // MARK: - Display Link
@@ -153,15 +177,58 @@ class GameView: NSView, CALayerDelegate {
 
         let callback: CVDisplayLinkOutputCallback = { _, _, _, _, _, userInfo -> CVReturn in
             let view = Unmanaged<GameView>.fromOpaque(userInfo!).takeUnretainedValue()
-            DispatchQueue.main.async {
-                view.renderFrame()
-            }
+            view.scheduleRenderFrame()
             return kCVReturnSuccess
         }
 
         CVDisplayLinkSetOutputCallback(displayLink, callback,
                                        Unmanaged.passUnretained(self).toOpaque())
         CVDisplayLinkStart(displayLink)
+    }
+
+    private func scheduleRenderFrame() {
+        inputLock.lock()
+        guard !renderFrameQueued else {
+            inputLock.unlock()
+            return
+        }
+        renderFrameQueued = true
+        inputLock.unlock()
+
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            self.renderFrame()
+            self.inputLock.lock()
+            self.renderFrameQueued = false
+            self.inputLock.unlock()
+        }
+    }
+
+    private func consumeInputSnapshot() -> InputSnapshot {
+        inputLock.lock()
+        defer { inputLock.unlock() }
+
+        let snapshot = InputSnapshot(
+            forward: keysPressed.contains(keyW),
+            back: keysPressed.contains(keyS),
+            left: keysPressed.contains(keyA),
+            right: keysPressed.contains(keyD),
+            up: keysPressed.contains(keySpace),
+            sprint: shiftPressed,
+            mouseDeltaX: mouseDeltaX,
+            mouseDeltaY: mouseDeltaY,
+            cycleRenderMode: pendingRenderModeCycle,
+            cycleDenoiseMethod: pendingDenoiseMethodCycle,
+            requestScreenshot: pendingScreenshotRequest
+        )
+
+        mouseDeltaX = 0
+        mouseDeltaY = 0
+        pendingRenderModeCycle = false
+        pendingDenoiseMethodCycle = false
+        pendingScreenshotRequest = false
+
+        return snapshot
     }
 
     private func renderFrame() {
@@ -184,14 +251,27 @@ class GameView: NSView, CALayerDelegate {
         }
 
         let dt: Float = 1.0 / 60.0
+        let input = consumeInputSnapshot()
+
+        if input.cycleRenderMode {
+            renderer.cycleRenderMode()
+        }
+
+        if input.cycleDenoiseMethod {
+            renderer.cycleDenoiseMethod()
+        }
+
+        if input.requestScreenshot {
+            renderer.pendingScreenshot = true
+        }
 
         // Update camera from input
-        var forward = keysPressed.contains(keyW)
-        let back    = keysPressed.contains(keyS)
-        let left    = keysPressed.contains(keyA)
-        let right   = keysPressed.contains(keyD)
-        let up      = keysPressed.contains(keySpace)
-        let sprint  = shiftPressed
+        var forward = input.forward
+        let back = input.back
+        let left = input.left
+        let right = input.right
+        let up = input.up
+        let sprint = input.sprint
 
         if var scriptedOIDNRepro {
             let step = scriptedOIDNRepro.advance()
@@ -220,13 +300,10 @@ class GameView: NSView, CALayerDelegate {
             forward: forward, back: back,
             left: left, right: right,
             up: up, sprint: sprint,
-            mouseDeltaX: mouseDeltaX,
-            mouseDeltaY: mouseDeltaY,
+            mouseDeltaX: input.mouseDeltaX,
+            mouseDeltaY: input.mouseDeltaY,
             dt: dt
         )
-
-        mouseDeltaX = 0
-        mouseDeltaY = 0
 
         // Render
         guard let drawable = metalLayer.nextDrawable() else {
@@ -241,7 +318,10 @@ class GameView: NSView, CALayerDelegate {
         }
 
         // Update title with compact scene, camera, and render state.
-        window?.title = renderer.windowTitle
+        let windowTitle = renderer.windowTitle
+        DispatchQueue.main.async { [weak self] in
+            self?.window?.title = windowTitle
+        }
     }
 
     deinit {
@@ -261,28 +341,40 @@ class GameView: NSView, CALayerDelegate {
             }
         } else if event.keyCode == keyM {
             if !event.isARepeat {
-                renderer?.cycleRenderMode()
+                inputLock.lock()
+                pendingRenderModeCycle = true
+                inputLock.unlock()
             }
             return
         } else if event.keyCode == keyN {
             if !event.isARepeat {
-                renderer?.cycleDenoiseMethod()
+                inputLock.lock()
+                pendingDenoiseMethodCycle = true
+                inputLock.unlock()
             }
             return
         } else if event.keyCode == keyF12 {
-            renderer?.pendingScreenshot = true
+            inputLock.lock()
+            pendingScreenshotRequest = true
+            inputLock.unlock()
         }
 
+        inputLock.lock()
         keysPressed.insert(event.keyCode)
+        inputLock.unlock()
     }
 
     override func keyUp(with event: NSEvent) {
+        inputLock.lock()
         keysPressed.remove(event.keyCode)
+        inputLock.unlock()
     }
 
     override func flagsChanged(with event: NSEvent) {
         if event.keyCode == keyLeftShift || event.keyCode == keyRightShift {
+            inputLock.lock()
             shiftPressed = event.modifierFlags.contains(.shift)
+            inputLock.unlock()
         }
     }
 
@@ -290,8 +382,10 @@ class GameView: NSView, CALayerDelegate {
 
     override func mouseMoved(with event: NSEvent) {
         guard mouseCaptured else { return }
+        inputLock.lock()
         mouseDeltaX += Float(event.deltaX)
         mouseDeltaY += Float(event.deltaY)
+        inputLock.unlock()
     }
 
     override func mouseDragged(with event: NSEvent) {

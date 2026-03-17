@@ -956,6 +956,18 @@ class Renderer {
                              submitTime: CFTimeInterval,
                              onComplete: (() -> Void)?,
                              postCompletion: (() -> Void)? = nil) {
+        let verifyTargetFrame = currentVerifyTargetFrame()
+        let needsVerify = verifyConfig.enabled
+            && !verifyCompleted
+            && verifyTargetFrame != nil
+            && accumulationCount >= verifyTargetFrame!
+        let needsScreenshot = pendingScreenshot
+        if needsScreenshot { pendingScreenshot = false }
+        if needsVerify || needsScreenshot { captureInProgress = true }
+
+        let capturedLDRTexture = (needsVerify || needsScreenshot) ? pathTracer.tonemappedTexture : nil
+        let tonemapTargetTexture = capturedLDRTexture ?? drawable.texture
+
         let hasExposureMeasurement = exposureSource != nil
         if let exposureSource {
             pathTracer.encodeExposureMeasurement(commandBuffer: commandBuffer,
@@ -966,28 +978,16 @@ class Renderer {
                                                        sourceTexture: hdrSource) ?? hdrSource
             pathTracer.encodeTonemap(commandBuffer: commandBuffer,
                                      uniforms: &uniforms,
-                                     sourceTexture: tonemapSource)
+                                     sourceTexture: tonemapSource,
+                                     targetTexture: tonemapTargetTexture)
         }
-
-        let verifyTargetFrame = currentVerifyTargetFrame()
-        let needsVerify = verifyConfig.enabled
-            && !verifyCompleted
-            && verifyTargetFrame != nil
-            && accumulationCount >= verifyTargetFrame!
-        let needsScreenshot = pendingScreenshot
-        if needsScreenshot { pendingScreenshot = false }
-        if needsVerify || needsScreenshot { captureInProgress = true }
 
         let verifyHDRTexture = makeVerifyHDRTexture(from: hdrSource,
                                                     commandBuffer: commandBuffer,
                                                     needsVerify: needsVerify)
 
-        guard let tonemapped = pathTracer.tonemappedTexture else {
-            onComplete?()
-            return
-        }
-
-        if let blit = commandBuffer.makeBlitCommandEncoder() {
+        if let tonemapped = capturedLDRTexture,
+           let blit = commandBuffer.makeBlitCommandEncoder() {
             let drawableTexture = drawable.texture
             let srcSize = MTLSize(width: min(tonemapped.width, drawableTexture.width),
                                   height: min(tonemapped.height, drawableTexture.height),
@@ -1024,7 +1024,7 @@ class Renderer {
                                  self.accumulationCount))
                 }
 
-                if let tex = self.pathTracer.tonemappedTexture {
+                if let tex = capturedLDRTexture {
                     if needsVerify {
                         self.performVerifyCapture(texture: tex,
                                                   hdrTexture: verifyHDRTexture,
@@ -1332,29 +1332,52 @@ class Renderer {
     // MARK: - Helpers
 
     private func findAssetsDirectory() -> URL {
-        // Look for assets/maps/ relative to the executable, or in the project directory
         let fileManager = FileManager.default
+        let assetPathComponents = ["assets", "maps"]
 
-        // Try working directory
-        let cwdAssets = URL(fileURLWithPath: fileManager.currentDirectoryPath)
-            .appendingPathComponent("assets/maps")
-        if fileManager.fileExists(atPath: cwdAssets.path) {
-            return cwdAssets
-        }
+        func ancestors(of startURL: URL) -> [URL] {
+            var results: [URL] = []
+            var currentURL = startURL.standardizedFileURL
 
-        // Try next to the executable
-        let execURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
-        let execAssets = execURL.appendingPathComponent("assets/maps")
-        if fileManager.fileExists(atPath: execAssets.path) {
-            return execAssets
-        }
-
-        // Try the app bundle
-        if let resourcePath = Bundle.main.resourcePath {
-            let bundleAssets = URL(fileURLWithPath: resourcePath).appendingPathComponent("assets/maps")
-            if fileManager.fileExists(atPath: bundleAssets.path) {
-                return bundleAssets
+            while true {
+                results.append(currentURL)
+                let parentURL = currentURL.deletingLastPathComponent()
+                if parentURL.path == currentURL.path {
+                    break
+                }
+                currentURL = parentURL
             }
+
+            return results
+        }
+
+        func assetDirectory(from roots: [URL]) -> URL? {
+            for rootURL in roots {
+                for ancestorURL in ancestors(of: rootURL) {
+                    let candidateURL = assetPathComponents.reduce(ancestorURL) { partialURL, component in
+                        partialURL.appendingPathComponent(component)
+                    }
+                    if fileManager.fileExists(atPath: candidateURL.path) {
+                        return candidateURL
+                    }
+                }
+            }
+
+            return nil
+        }
+
+        let cwdURL = URL(fileURLWithPath: fileManager.currentDirectoryPath)
+        let executableDirectoryURL = URL(fileURLWithPath: CommandLine.arguments[0]).deletingLastPathComponent()
+        let bundleURL = Bundle.main.bundleURL.standardizedFileURL
+        let resourceURL = Bundle.main.resourceURL?.standardizedFileURL
+
+        var searchRoots = [cwdURL, executableDirectoryURL, bundleURL]
+        if let resourceURL {
+            searchRoots.append(resourceURL)
+        }
+
+        if let resolvedAssetsURL = assetDirectory(from: searchRoots) {
+            return resolvedAssetsURL
         }
 
         // Try standard dev path
@@ -1364,6 +1387,9 @@ class Renderer {
         }
 
         // Fallback: create assets directory in working dir
+        let cwdAssets = assetPathComponents.reduce(cwdURL) { partialURL, component in
+            partialURL.appendingPathComponent(component)
+        }
         try? fileManager.createDirectory(at: cwdAssets, withIntermediateDirectories: true)
         return cwdAssets
     }
